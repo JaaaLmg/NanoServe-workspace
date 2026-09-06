@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanoserve"
+version = "0.1.0"
+description = "A long-context, high-concurrency LLM serving engine built on nano-vLLM"
+readme = "README.md"
+license = { file = "LICENSE.nanovllm" }
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "torch>=2.4.0",
+    "triton>=3.0.0",
+    "transformers>=4.51.0",
+    # nanovllm/layers/attention.py 目前硬编码依赖 FlashAttention-2，
+    # 仅支持 Ampere(sm_80) 及以上架构；Turing 卡（如 RTX 2080 Ti）需等待 SDPA 后备实现
+    "flash-attn>=2.8.0",
+    "xxhash",
+]
+
+[project.optional-dependencies]
+# 模型下载: pip install -e ".[download]"
+download = ["huggingface_hub[cli]"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nanovllm*"]
