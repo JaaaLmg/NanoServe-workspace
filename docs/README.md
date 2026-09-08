@@ -1,6 +1,6 @@
 # NanoServe 文档索引
 
-按 `plan.md` 的 20 天计划组织，当前覆盖 **Day 1–5**。
+按 `plan.md` 的 20 天计划组织，当前覆盖 **Day 1–6**。
 
 ## 按天索引
 
@@ -14,7 +14,9 @@
 - [采样器代码详解](./sampler.md)：SamplingParams、Sampler、seed 与推理链路的详细说明。
 - [Day 5 性能测试报告](./day5-performance.md)：baseline runner 的指标口径、矩阵、原始结果 schema 与复现步骤。
 - [Day 4–5 验收记录](./day4-5-validation.md)：任务逐项验收范围、命令和实测边界。
+- [Day 6 请求生命周期与状态机设计](./request-lifecycle.md)：六态模型、迁移图、Scheduler/Sequence/Engine 调整方案、资源不变量、风险、测试与最终验收清单。
 
 ## 其他
 
+- [开发待办清单](./TODO.md)：记录后续阅读与实现事项。
 - [上游 nano-vLLM README 存档](./nanovllm-README.md)：上游项目说明，不代表 NanoServe 后续功能已完成。
