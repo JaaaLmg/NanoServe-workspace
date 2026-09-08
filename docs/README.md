@@ -1,6 +1,6 @@
 # NanoServe 文档索引
 
-按 `plan.md` 的 20 天计划组织，当前覆盖 **Day 1–3**。
+按 `plan.md` 的 20 天计划组织，当前覆盖 **Day 1–5**。
 
 ## 按天索引
 
@@ -10,8 +10,11 @@
 - [Day 3 Paged KV Cache](./kv-cache.md)：逻辑 token → 逻辑块 → 物理 KV 块的三层映射、块生命周期图、申请/写入/复用/释放/抢占五条路径、prefix cache 机制与碎片分析（含本机实测 KV 池数据）。
 - [Day 2–3 验收记录](./day2-3-validation.md)：两天的产出清单、单元测试运行结果（17 passed）和验收结论。
 
+- [Day 4 Prefill/Decode 与采样](./prefill-decode.md)：阶段 shape、KV 数据流、瓶颈与固定 seed 采样实验。
+- [采样器代码详解](./sampler.md)：SamplingParams、Sampler、seed 与推理链路的详细说明。
+- [Day 5 性能测试报告](./day5-performance.md)：baseline runner 的指标口径、矩阵、原始结果 schema 与复现步骤。
+- [Day 4–5 验收记录](./day4-5-validation.md)：任务逐项验收范围、命令和实测边界。
+
 ## 其他
 
 - [上游 nano-vLLM README 存档](./nanovllm-README.md)：上游项目说明，不代表 NanoServe 后续功能已完成。
-
-Day 4 及之后的 prefill/decode 对比、服务接口、benchmark 等文档将在对应任务完成后再补充。
