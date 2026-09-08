@@ -1,0 +1,37 @@
+{
+  "seed": 2026,
+  "prompts": [
+    "Explain caching in one sentence.",
+    "What is a tensor?",
+    "Give three colors.",
+    "Why batch requests?",
+    "Define latency."
+  ],
+  "greedy_run_1": [
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "greedy_run_2": [
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "greedy_reproducible": true,
+  "sampled_top_p_0.8": [
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "max_tokens": 8,
+  "environment": {
+    "python": "3.12.3",
+    "torch": "2.5.1+cu124"
+  }
+}

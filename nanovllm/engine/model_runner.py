@@ -31,6 +31,7 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        self.generators = {}
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -188,9 +189,19 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
-        temperatures = [seq.temperature for seq in seqs]
-        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
-        return temperatures
+        temperatures = torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        top_ps = torch.tensor([seq.top_p for seq in seqs], dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        generators = []
+        for seq in seqs:
+            if seq.seed is None:
+                generators.append(None)
+                continue
+            generator = self.generators.get(seq.seq_id)
+            if generator is None:
+                generator = torch.Generator(device="cuda").manual_seed(seq.seed)
+                self.generators[seq.seq_id] = generator
+            generators.append(generator)
+        return temperatures, top_ps, generators
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
@@ -213,9 +224,9 @@ class ModelRunner:
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        temperatures, top_ps, generators = self.prepare_sample(seqs) if self.rank == 0 else (None, None, None)
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids = self.sampler(logits, temperatures, top_ps, generators).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 
