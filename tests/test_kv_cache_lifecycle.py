@@ -142,7 +142,10 @@ class TestPreemption:
         seqs, is_prefill = sched.schedule()
         assert is_prefill is False
         assert seqs == [a]
+        # Day6 状态机：抢占路径为 RUNNING -> PREEMPTED ->（resume 同一调用内完成）-> WAITING。
+        # 调度边界的观察点是恢复后的 WAITING，PREEMPTED 事件记录在抢占历史中
         assert b.status == SequenceStatus.WAITING  # 被抢占，回到 waiting 队首
+        assert b.num_preempts == 1 and b.last_preempted_at is not None
         assert list(sched.waiting) == [b]
         assert b.block_table == []  # b 的块被释放
         assert len(a.block_table) == 2
