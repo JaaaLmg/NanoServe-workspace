@@ -1,6 +1,6 @@
 # NanoServe 文档索引
 
-按 `plan.md` 的 20 天计划组织，当前覆盖 **Day 1–6**。
+按 `plan.md` 的 20 天计划组织，当前覆盖 **Day 1–7 设计**。本分支从 `dev=555ef43` 创建；Day6 完整实现与收尾记录在 `feature/request-lifecycle-state-machine` 的提交 `c84e73f`，尚未集成到此分支。Day7 当前仅规划，实施前需经授权集成 Day6 基础。
 
 ## 按天索引
 
@@ -14,7 +14,8 @@
 - [采样器代码详解](./sampler.md)：SamplingParams、Sampler、seed 与推理链路的详细说明。
 - [Day 5 性能测试报告](./day5-performance.md)：baseline runner 的指标口径、矩阵、原始结果 schema 与复现步骤。
 - [Day 4–5 验收记录](./day4-5-validation.md)：任务逐项验收范围、命令和实测边界。
-- [Day 6 请求生命周期与状态机设计](./request-lifecycle.md)：六态模型、迁移图、Scheduler/Sequence/Engine 调整方案、资源不变量、风险、测试与最终验收清单。
+- [Day 6 请求生命周期与状态机设计](./request-lifecycle.md)：六态模型、迁移图、Scheduler/Sequence/Engine 调整方案、资源不变量、风险、测试与最终验收清单。本工作树版本来自 dev，完整收尾清单与验收记录以 `c84e73f` 为准。
+- [Day 7 每轮 Token Budget 与 FCFS 调度设计](./token-budget.md)：两阶段统一预算、FCFS 与既有分块边界、预算等待人数/时间、计划与执行日志、CPU/GPU 测试及验收方案（待实现）。
 
 ## 其他
 
