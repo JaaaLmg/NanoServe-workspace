@@ -4,7 +4,7 @@ GPU/model runs are intentionally explicit: unavailable or OOM cases are kept
 in the JSON rather than silently omitted.  The engine API is synchronous, so
 TTFT is measured at the first completed decode step.
 """
-import argparse, json, os, platform, subprocess, time, sys
+import argparse, atexit, json, os, platform, subprocess, time, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
@@ -19,6 +19,7 @@ def percentile(values, q):
 def run_case(model, concurrency, prompt_len, output_len, enforce_eager):
     started = time.perf_counter(); record = {"status":"ok", "concurrency":concurrency, "prompt_tokens":prompt_len, "max_tokens":output_len, "requests":[]}
     if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
+    llm = None
     try:
         llm = LLM(model, enforce_eager=enforce_eager, max_num_seqs=concurrency)
         prompts = [list(range(100, 100 + prompt_len)) for _ in range(concurrency)]
@@ -47,6 +48,14 @@ def run_case(model, concurrency, prompt_len, output_len, enforce_eager):
         else: record["memory"]={"available":False}
     except Exception as exc:
         record.update(status="error", error=f"{type(exc).__name__}: {exc}")
+    finally:
+        # Each case builds its own engine; without tearing it down the next
+        # case hits "default process group twice" and old KV cache stays resident.
+        if llm is not None:
+            try: atexit.unregister(llm.exit); llm.exit()
+            except Exception as cleanup_exc: print(f"cleanup warning: {cleanup_exc}", file=sys.stderr)
+            llm = None
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
     return record
 
 def main():
