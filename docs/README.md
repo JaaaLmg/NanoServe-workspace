@@ -15,6 +15,9 @@
 - [Day 5 性能测试报告](./day5-performance.md)：baseline runner 的指标口径、矩阵、原始结果 schema 与复现步骤。
 - [Day 4–5 验收记录](./day4-5-validation.md)：任务逐项验收范围、命令和实测边界。
 - [Day 6 请求生命周期与状态机设计](./request-lifecycle.md)：六态模型、迁移图、Scheduler/Sequence/Engine 调整方案、资源不变量、风险、测试与最终验收清单。
+- [Day 6 验收记录](./day6-validation.md)：Day6 收尾与提交交付（16/16 项），99 项回归、GPU 11 组实测及未覆盖边界。
+- [Day 6 实现审查](./day6-review.md)：三轮独立审查、缺陷修复关闭依据、CPU/GPU 证据及最终收尾记录。
+- [Day 6 请求生命周期教程](./day6-tutorial.md)：面向推理引擎初学者的代码导读——引擎执行模型、六状态机、Sequence/Scheduler/Engine 精读、三本账一致性不变量、审查缺陷复盘与测试方法。
 
 ## 其他
 
