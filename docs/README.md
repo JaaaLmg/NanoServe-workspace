@@ -1,6 +1,6 @@
 # NanoServe 文档索引
 
-按 `plan.md` 的 20 天计划组织，当前覆盖 **Day 1–7 设计**。本分支从 `dev=555ef43` 创建；Day6 完整实现与收尾记录在 `feature/request-lifecycle-state-machine` 的提交 `c84e73f`，尚未集成到此分支。Day7 当前仅规划，实施前需经授权集成 Day6 基础。
+按 `plan.md` 的 20 天计划组织，当前覆盖 **Day 1–7 设计**。本分支从 `dev=555ef43` 创建，并已合并 dev 集成 Day6 实现（提交 `c84e73f`）。Day7 当前仅规划，代码实现进行中。
 
 ## 按天索引
 
@@ -14,7 +14,10 @@
 - [采样器代码详解](./sampler.md)：SamplingParams、Sampler、seed 与推理链路的详细说明。
 - [Day 5 性能测试报告](./day5-performance.md)：baseline runner 的指标口径、矩阵、原始结果 schema 与复现步骤。
 - [Day 4–5 验收记录](./day4-5-validation.md)：任务逐项验收范围、命令和实测边界。
-- [Day 6 请求生命周期与状态机设计](./request-lifecycle.md)：六态模型、迁移图、Scheduler/Sequence/Engine 调整方案、资源不变量、风险、测试与最终验收清单。本工作树版本来自 dev，完整收尾清单与验收记录以 `c84e73f` 为准。
+- [Day 6 请求生命周期与状态机设计](./request-lifecycle.md)：六态模型、迁移图、Scheduler/Sequence/Engine 调整方案、资源不变量、风险、测试与最终验收清单。
+- [Day 6 验收记录](./day6-validation.md)：Day6 收尾与提交交付（16/16 项），99 项回归、GPU 11 组实测及未覆盖边界。
+- [Day 6 实现审查](./day6-review.md)：三轮独立审查、缺陷修复关闭依据、CPU/GPU 证据及最终收尾记录。
+- [Day 6 请求生命周期教程](./day6-tutorial.md)：面向推理引擎初学者的代码导读——引擎执行模型、六状态机、Sequence/Scheduler/Engine 精读、三本账一致性不变量、审查缺陷复盘与测试方法。
 - [Day 7 每轮 Token Budget 与 FCFS 调度设计](./token-budget.md)：两阶段统一预算、FCFS 与既有分块边界、预算等待人数/时间、计划与执行日志、CPU/GPU 测试及验收方案（待实现）。
 
 ## 其他
