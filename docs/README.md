@@ -1,6 +1,6 @@
 # NanoServe 文档索引
 
-按 `plan.md` 的 20 天计划组织，当前覆盖 **Day 1–7 设计**。本分支从 `dev=555ef43` 创建，并已合并 dev 集成 Day6 实现（提交 `c84e73f`）。Day7 当前仅规划，代码实现进行中。
+按 `plan.md` 的 20 天计划组织，当前覆盖 **Day 1–7**。本分支从 `dev=555ef43` 创建，并已合并 dev 集成 Day6 实现（提交 `c84e73f`）。Day7 已完成实现与验收，记录见 `day7-validation.md`。
 
 ## 按天索引
 
@@ -18,7 +18,9 @@
 - [Day 6 验收记录](./day6-validation.md)：Day6 收尾与提交交付（16/16 项），99 项回归、GPU 11 组实测及未覆盖边界。
 - [Day 6 实现审查](./day6-review.md)：三轮独立审查、缺陷修复关闭依据、CPU/GPU 证据及最终收尾记录。
 - [Day 6 请求生命周期教程](./day6-tutorial.md)：面向推理引擎初学者的代码导读——引擎执行模型、六状态机、Sequence/Scheduler/Engine 精读、三本账一致性不变量、审查缺陷复盘与测试方法。
-- [Day 7 每轮 Token Budget 与 FCFS 调度设计](./token-budget.md)：两阶段统一预算、FCFS 与既有分块边界、预算等待人数/时间、计划与执行日志、CPU/GPU 测试及验收方案（待实现）。
+- [Day 7 每轮 Token Budget 与 FCFS 调度设计](./token-budget.md)：两阶段统一预算、FCFS 与既有分块边界、预算等待人数/时间、计划与执行日志、CPU/GPU 测试及验收方案。
+- [Day 7 验收记录](./day7-validation.md)：预算/统计/日志实现与 68 项新测试、三档 GPU 预算 sweep、greedy 5/5 一致对比及验收清单逐项核对；原始 JSONL 证据位于 `docs/evidence/day7/`。
+- [Day 7 实现审查](./day7-review.md)：对照设计复核调度逻辑、事件契约、验收工具和证据完整性；记录已补强项与尚未达标边界。
 
 ## 其他
 
