@@ -309,50 +309,57 @@ class ModelRunner:
             raise ValueError(f"批次存在未知 phase 的 item: {sorted(unknown)}")
         # ---------- decode 子批（在前）：last_token 单步前向 ----------
         if decode_items:
-            seqs = [it.seq for it in decode_items]
-            input_ids, positions = self.prepare_decode(seqs)
-            logits = self.run_model(input_ids, positions, False)
-            if self.rank == 0:
-                temperatures, top_ps, generators = self.prepare_sample(seqs)
-                token_ids.extend(
-                    self.sampler(logits, temperatures, top_ps, generators).tolist())
-            reset_context()
+            try:
+                seqs = [it.seq for it in decode_items]
+                input_ids, positions = self.prepare_decode(seqs)
+                logits = self.run_model(input_ids, positions, False)
+                if self.rank == 0:
+                    temperatures, top_ps, generators = self.prepare_sample(seqs)
+                    token_ids.extend(
+                        self.sampler(logits, temperatures, top_ps, generators).tolist())
+            finally:
+                # 无论组装、前向还是采样是否异常，都不能把 decode Context
+                # 泄漏给后续 prefill 子批或下一轮。
+                reset_context()
         # ---------- prefill 子批（在后）：显式 offset 契约组装 ----------
         if prefill_items:
-            seqs = [it.seq for it in prefill_items]
-            input_ids, positions = self.prepare_prefill(seqs)
-            logits = self.run_model(input_ids, positions, True)
-            if self.rank == 0:
-                # ---------- prefill 采样契约（Day8 沿用） ----------
-                # 1) 行选择：ParallelLMHead 在 prefill 分支已按 cu_seqlens_q[1:]-1
-                #    把每个请求的"最后一个 query 行"聚合为 [len(seqs), vocab]；
-                #    显式校验行数与请求一一对应，形状错位不再静默。
-                # 2) 中间 chunk 不采样、不消耗 RNG：torch.multinomial 会推进
-                #    generator 状态，若中间 chunk 也采样，chunk 划分不同就会改变
-                #    RNG 流，"chunked 与 one-shot 输出一致"在随机采样下不可达。
-                #    因此只有最后 chunk 才进入采样。
-                # 3) 行选择以 BatchItem.needs_sample（调度冻结快照）为准，并与
-                #    Sequence 具名谓词交叉校验——两者同源，不一致说明调度与执行
-                #    之间请求状态被破坏，尽早显式失败。
-                if logits.shape[0] != len(seqs):
-                    raise ValueError(
-                        f"prefill logits 行数 {logits.shape[0]} 与请求数 {len(seqs)} 不一致，"
-                        "每请求应恰好聚合出其最后 query 行")
-                sample_idx = [i for i, it in enumerate(prefill_items) if it.needs_sample]
-                predicate_idx = self._select_prefill_sample_rows(seqs)
-                if sample_idx != predicate_idx:
-                    raise ValueError(
-                        f"BatchItem.needs_sample 快照 {sample_idx} 与执行侧谓词 "
-                        f"{predicate_idx} 不一致，调度与执行之间的请求状态被破坏")
-                if sample_idx:
-                    temperatures, top_ps, generators = self.prepare_sample(seqs)
-                    token_ids.extend(self.sampler(
-                        logits[sample_idx],
-                        temperatures[sample_idx],
-                        top_ps[sample_idx],
-                        [generators[i] for i in sample_idx],
-                    ).tolist())
-            reset_context()
+            try:
+                seqs = [it.seq for it in prefill_items]
+                input_ids, positions = self.prepare_prefill(seqs)
+                logits = self.run_model(input_ids, positions, True)
+                if self.rank == 0:
+                    # ---------- prefill 采样契约（Day8 沿用） ----------
+                    # 1) 行选择：ParallelLMHead 在 prefill 分支已按 cu_seqlens_q[1:]-1
+                    #    把每个请求的"最后一个 query 行"聚合为 [len(seqs), vocab]；
+                    #    显式校验行数与请求一一对应，形状错位不再静默。
+                    # 2) 中间 chunk 不采样、不消耗 RNG：torch.multinomial 会推进
+                    #    generator 状态，若中间 chunk 也采样，chunk 划分不同就会改变
+                    #    RNG 流，"chunked 与 one-shot 输出一致"在随机采样下不可达。
+                    #    因此只有最后 chunk 才进入采样。
+                    # 3) 行选择以 BatchItem.needs_sample（调度冻结快照）为准，并与
+                    #    Sequence 具名谓词交叉校验——两者同源，不一致说明调度与执行
+                    #    之间请求状态被破坏，尽早显式失败。
+                    if logits.shape[0] != len(seqs):
+                        raise ValueError(
+                            f"prefill logits 行数 {logits.shape[0]} 与请求数 {len(seqs)} 不一致，"
+                            "每请求应恰好聚合出其最后 query 行")
+                    sample_idx = [i for i, it in enumerate(prefill_items) if it.needs_sample]
+                    predicate_idx = self._select_prefill_sample_rows(seqs)
+                    if sample_idx != predicate_idx:
+                        raise ValueError(
+                            f"BatchItem.needs_sample 快照 {sample_idx} 与执行侧谓词 "
+                            f"{predicate_idx} 不一致，调度与执行之间的请求状态被破坏")
+                    if sample_idx:
+                        temperatures, top_ps, generators = self.prepare_sample(seqs)
+                        token_ids.extend(self.sampler(
+                            logits[sample_idx],
+                            temperatures[sample_idx],
+                            top_ps[sample_idx],
+                            [generators[i] for i in sample_idx],
+                        ).tolist())
+            finally:
+                # 同样保证 prefill 异常不会把全局 Context 带入下一轮。
+                reset_context()
         if self.rank != 0:
             # worker 只负责前向与 KV 写入，不消费 logits/不采样（TP 语义沿用）
             return None

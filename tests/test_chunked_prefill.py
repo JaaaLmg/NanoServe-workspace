@@ -65,6 +65,18 @@ EOS = 999_999  # 测试中不会出现的 token id，配合 ignore_eos 使用
 # 真实运行时由 LLMEngine 设置（nanovllm/engine/llm_engine.py），测试手动对齐
 Sequence.block_size = BLOCK_SIZE
 
+# Day10：Sequence 构造校验 deadline >= created_at（单调时钟，§4.1/§6.2）。
+# 本文件在虚拟时间轴上注入小数值 now（如 10.0/12.0），因此把 Sequence.clock
+# 注入为固定 0.0，使 created_at 与虚拟时间轴同轴、构造校验可确定性通过；
+# fixture 结束时恢复真实时钟，避免跨测试泄漏。
+@pytest.fixture(autouse=True)
+def _fixed_sequence_clock():
+    original = Sequence.clock
+    Sequence.clock = staticmethod(lambda: 1.0)
+    yield
+    Sequence.clock = original
+
+
 WAITING = SequenceStatus.WAITING
 RUNNING = SequenceStatus.RUNNING
 PREEMPTED = SequenceStatus.PREEMPTED

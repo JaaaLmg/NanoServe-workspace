@@ -1,6 +1,6 @@
 # NanoServe 文档索引
 
-按 `plan.md` 的 20 天计划组织，当前覆盖 **Day 1–9**（Day 9 已完成实现与验收，记录见 `day9-validation.md`）。本分支从 `dev=555ef43` 创建，并已合并 dev 集成 Day6 实现（提交 `c84e73f`）。Day7 已完成实现与验收，记录见 `day7-validation.md`；Day8 已在 `feature/chunked-prefill` 分支完成实现，验收记录见 `day8-validation.md`。
+按 `plan.md` 的 20 天计划组织，当前覆盖 **Day 1–10**（Day 9 已完成实现与验收；Day 10 已完成实现、代码审查与 CPU 验收，GPU 主流程证据沿用已有记录，详见 `day10-validation.md` 与 `day10-review.md`）。Day7 已完成实现与验收，记录见 `day7-validation.md`；Day8 已在 `feature/chunked-prefill` 分支完成实现，验收记录见 `day8-validation.md`。
 
 ## 按天索引
 
@@ -30,6 +30,10 @@
 - [Day 9 实现审查](./day9-review.md)：对照设计复核混合调度/归因/采样与执行契约；记录 `warmup_model` 旧签名调用 `run()` 的 GPU 启动阻断缺陷（附修复建议）、`decode_priority` 判定与不变量 18 的偏差分析及可读性建议。
 - [Day 9 验收记录](./day9-validation.md)：审查问题修复（warmup 签名 P0、归因对齐不变量 18）、CPU 303 项回归、GPU 主负载 mixed vs one-shot 对照（短请求 TTFT P50 3.57s→0.20s、decode 7/7 轮持续产出、`runner_input_len` 对账收口）、greedy 26/33 差异分析与确定性复现；原始 JSONL 证据位于 `docs/evidence/day9/`。
 - [Day 9 混合 Prefill 与 Decode 教程](./day9-tutorial.md)：面向推理引擎初学者的代码导读——从"整批单阶段"的 decode 停滞到 decode-first 混合调度、`BatchItem` 逐请求标注、一轮两次前向的显式取舍、归因重构与 `needed_first` 规则、逐 item 提交与 round 关联、GPU 对照证据解读与思考题。
+- [Day 10 取消、超时、抢占与恢复设计](./request-cancellation-preemption.md)：取消信号与 deadline 安全边界、KV 不足时的抢占/recompute 恢复、混合轮逐 item 隔离、异常 `finally` 清理、100 请求资源稳定性测试矩阵与验收清单。
+- [Day 10 验收记录](./day10-validation.md)：实现范围与取舍（signal-only 取消/安全点收尾、victim 队尾优先与无 victim 延后、abort 事务、账本守恒检查）、修复后 CPU 377 项回归与 5 场景验收、GPU 六组矩阵（含 16 块小池 3 次自动抢占与 100 请求终态平衡），并记录本轮审查后的未覆盖边界；原始 JSONL 证据位于 `docs/evidence/day10/`。
+- [Day 10 实现审查](./day10-review.md)：逐项复核状态/控制面、抢占恢复、异常清理、KV 账本、序列化与事件契约；记录最终修复项、377 项 CPU 回归、TP=1 GPU 六组证据和 TP>1/CUDA Graph/真实并发等未覆盖边界。
+- [Day 10 教程](./day10-tutorial.md)：面向初学者讲解三种进度、六态生命周期、取消与 deadline 安全点、KV 抢占恢复、异常事务、账本所有权、事件审计、测试证据与后续服务化衔接。
 
 ## 其他
 

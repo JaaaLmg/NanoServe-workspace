@@ -91,6 +91,11 @@ class InvalidStateTransition(Exception):
 class Sequence:
     block_size = 256
     counter = count()
+    # 单调时钟入口（Day10 §4.1/§6.2）：created_at/deadline 统一使用同一时钟语义，
+    # 默认 perf_counter（不可回拨）。测试可注入固定时钟，使构造校验与调度注入的
+    # now 处于同一可控时间轴（§9.1 "测试可注入固定时钟"）。
+    # 用 staticmethod 包装：实例访问 self.clock() 不会把 self 绑定进参数。
+    clock = staticmethod(perf_counter)
     # 序列化格式版本：v1 为旧 6 元组（不含控制面字段）；
     # v2 为 (版本号, 字段名字典)，新增控制面字段且可向后兼容 v1；
     # v3 在 v2 基础上把 num_cached_tokens 字段改名为 prefill_offset
@@ -103,12 +108,20 @@ class Sequence:
         # 在构造入口显式拒绝，避免调度或模型组装阶段才暴露难排查的错误
         if not token_ids:
             raise ValueError("prompt 不能为空：至少需要 1 个 token 才能执行 prefill")
+        # Day10 构造校验：deadline 必须是单调时钟绝对时间，且不早于请求创建时刻
+        # （§4.1/§6.2）。拒绝已过期/回拨的 deadline 在入口显式失败，避免请求
+        # 进入调度后立刻被超时清理造成难以归因的"秒退"。
+        created_at = self.clock()
+        if deadline is not None and deadline < created_at:
+            raise ValueError(
+                f"deadline {deadline!r} 早于请求创建时刻 {created_at!r}；"
+                "deadline 必须是单调时钟（perf_counter）绝对时间且 >= created_at")
         self.seq_id = next(Sequence.counter)
         # 对外稳定的请求 ID：日志串联、Engine 取消入口使用；保留 seq_id 兼容内部排序
         self.request_id = request_id if request_id is not None else f"req-{self.seq_id}"
         self.status = SequenceStatus.WAITING
         # 时间信息统一使用单调时钟 perf_counter（不可回拨），deadline 判断才可靠
-        self.created_at = perf_counter()
+        self.created_at = created_at
         self.started_at: float | None = None
         self.finished_at: float | None = None
         self.deadline = deadline
@@ -251,7 +264,9 @@ class Sequence:
             raise InvalidStateTransition(self, old_status, new_status, reason)
         self.status = new_status
         if now is None:
-            now = perf_counter()
+            # 所有生命周期时间戳都走可注入的单调时钟入口，保证测试和
+            # 调度器事件不会因某个默认路径绕过 Sequence.clock 而分叉。
+            now = self.clock()
         if new_status == SequenceStatus.RUNNING:
             # started_at 只记录首次进入 RUNNING 的时间；抢占恢复后不重置
             if self.started_at is None:
@@ -288,9 +303,14 @@ class Sequence:
         return True
 
     def mark_cancelled(self, reason: str = "client_cancelled", now: float | None = None) -> bool:
-        """标记为已取消（幂等）：已终态返回 False。"""
+        """标记为已取消（幂等）：已终态返回 False。
+
+        若控制面已经记录了取消原因，状态迁移必须沿用首次原因，避免直接调用
+        Sequence 入口与 Scheduler 安全点入口产生不同的终态语义。
+        """
         if self.is_terminal:
             return False
+        reason = self.cancel_reason or reason
         self.transition_to(SequenceStatus.CANCELLED, reason=reason, now=now)
         return True
 
