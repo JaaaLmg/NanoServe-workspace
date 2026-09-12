@@ -68,10 +68,39 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
-        self.model_runner.call("exit")
-        del self.model_runner
-        for p in self.ps:
-            p.join()
+        """幂等释放 Engine 资源；退出异常不能跳过 Scheduler/worker 清理。"""
+        runner = getattr(self, "model_runner", None)
+        if runner is None:
+            return
+        errors = []
+        # Scheduler 清理、runner 退出和 worker join 相互隔离：任一步失败都不能
+        # 跳过后续资源回收，也不能覆盖最先发生的退出异常。
+        try:
+            scheduler = getattr(self, "scheduler", None)
+            if scheduler is not None and scheduler.requests:
+                scheduler.abort_all_active(reason="engine_exit")
+        except BaseException as exc:
+            errors.append(exc)
+            logger.exception("Engine 退出时 Scheduler 清理失败")
+        try:
+            runner.call("exit")
+        except BaseException as exc:
+            errors.append(exc)
+            logger.exception("ModelRunner 退出失败")
+        finally:
+            try:
+                del self.model_runner
+            except AttributeError:
+                pass
+            for process in getattr(self, "ps", []):
+                try:
+                    process.join()
+                except BaseException as exc:
+                    errors.append(exc)
+                    logger.exception("张量并行 worker 回收失败")
+            self.ps = []
+        if errors:
+            raise errors[0]
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams,
                     request_id: str | None = None, deadline: float | None = None) -> str:
@@ -88,23 +117,109 @@ class LLMEngine:
 
     def get_request(self, request_id: str) -> Sequence | None:
         """按 request_id 查找活动请求；请求进入终态后已被清理，返回 None。"""
-        for seq in self.scheduler.requests.values():
-            if seq.request_id == request_id:
-                return seq
-        return None
+        return self.scheduler.get_request(request_id)
 
     def cancel_request(self, request_id: str, reason: str = "client_cancelled") -> bool:
-        """取消指定请求（调度层幂等）：请求不存在或已终态返回 False。"""
-        seq = self.get_request(request_id)
-        if seq is None:
-            return False
-        return self.scheduler.cancel(seq.seq_id, reason=reason)
+        """取消指定请求（Day10 §4.3 信号语义）：请求不存在或已终态返回 False。
+
+        两段式语义：
+        - 先调用 Scheduler.request_cancel() 只置位控制面信号——该调用线程安全、
+          可在模型 forward 期间发起，不触碰 block/队列/token；
+        - Engine 空闲（当前无 step() 在驱动）时，立即在安全点完成 CANCELLED
+          迁移与资源释放；Engine 正在 step() 时只保持信号，由本次 step 的
+          postprocess 安全检查或下一轮 schedule() 边界扫描完成收尾——
+          保证绝不中途修改正在被执行批次使用的 block_table。
+        """
+        # 查找与 signal 在 Scheduler 同一把锁内完成，避免 request_id 复用时
+        # 先查到旧对象、后按 seq_id 操作的 TOCTOU 竞态。
+        with self.scheduler._control_lock:
+            seq = self.scheduler.get_request(request_id)
+            if seq is None:
+                return False
+            signalled = seq.request_cancel(reason)
+            if signalled and not getattr(self, "_in_step", False):
+                self.scheduler.cancel(seq.seq_id, reason=reason)
+            return signalled
 
     def step(self):
+        """执行一轮调度 + 模型执行 + 逐 item 提交（Day10 §4.3 step 事务）。
+
+        事务顺序：
+        1. 检查 Engine 是否已失败（执行异常后禁止隐式重试，避免在不完整 KV 上重试）；
+        2. scheduler.schedule()：调度边界清理取消/超时/终态，生成 BatchItem + round_id；
+        3. 保存批次快照并显式校验计划；
+        4. try: ModelRunner 调用 + postprocess 逐 item 提交
+           except BaseException: abort_round（本轮回滚）+ abort_all_active（全活动收尾）
+                                + 锁定 Engine + error 事件，原异常继续向上传播
+           finally: 清除本轮临时计划与 round 标记（幂等兜底，保证不跨轮残留）；
+        5. 仅返回 FINISHED 的正常 outputs；取消/超时不伪装为正常 completion。
+
+        _in_step 全程置位（控制锁内翻转，与 cancel_request 的空闲判定共用同一
+        锁序）：step 期间外部 cancel_request 只置位信号，不做破坏性清理，
+        保证绝不中途修改正在被执行批次使用的 block_table。
+        """
         if getattr(self, "_execution_failed", False):
             raise RuntimeError(
                 "模型执行已失败，当前 Engine 禁止重试；请销毁并重新创建 Engine")
-        items, phase = self.scheduler.schedule()
+        with self.scheduler._control_lock:
+            self._in_step = True
+        try:
+            return self._step()
+        finally:
+            with self.scheduler._control_lock:
+                self._in_step = False
+
+    def _step(self):
+        """step 外层事务：连 schedule 阶段异常也必须进入失败收尾。"""
+        try:
+            return self._step_once()
+        except BaseException as original_error:
+            # 无论 _step_once 是否已经尝试过清理，都再执行一次幂等兜底；
+            # 这样清理异常不会让残留 requests/blocks 被失败锁遮蔽。
+            cleanup_errors = []
+            if not getattr(self, "_execution_failed", False):
+                self._execution_failed = True
+                round_id = self.scheduler._current_round_id
+                try:
+                    _log_event({
+                        "event": "engine_round", "round_id": round_id,
+                        # 调度阶段尚未形成可执行 batch，使用合法的 idle phase；
+                        # outcome=error 与 model_called=False 区分其异常语义。
+                        "phase": "idle", "token_budget": self.scheduler.max_num_batched_tokens,
+                        "planned_tokens": None, "executed_tokens": None,
+                        "model_called": False, "outcome": "error",
+                        "prefill_chunks": 0, "prefill_items": 0, "decode_items": 0,
+                        "prefill_tokens": 0, "decode_tokens": 0,
+                        "observed_at": perf_counter(),
+                    })
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            try:
+                if self.scheduler.requests:
+                    self.scheduler.abort_all_active(reason="engine_error")
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            try:
+                self.scheduler.block_manager.check_ledger()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            for cleanup_error in cleanup_errors:
+                logger.error("调度异常清理失败（原始异常将保留）: %r", cleanup_error)
+            raise
+        finally:
+            with self.scheduler._control_lock:
+                self.scheduler._current_round_id = None
+
+    def _step_once(self):
+        # schedule 也属于 step 事务：allocate/may_append/状态迁移可能在
+        # 修改账本后抛错，外层 _step 会统一执行失败收尾。
+        items = []
+        phase = "idle"
+        try:
+            items, phase = self.scheduler.schedule()
+        except BaseException as original_error:
+            # 保留本轮 schedule 已产生的半成品，由外层 abort_all_active 统一清理。
+            raise original_error
         # 调度计划快照：round_id / planned_tokens / 分阶段量取自 Scheduler 的本轮
         # 统计，是计划与执行日志按 round_id 关联的唯一权威（rank 0 为统计所有者）
         sched_stats = self.scheduler.last_schedule_stats or {}
@@ -162,22 +277,66 @@ class LLMEngine:
         num_tokens = planned
         try:
             token_ids = self.model_runner.call("run", items)
-        except Exception:
-            # 模型异常不假记成功执行：记录 error 与 planned_tokens，
-            # executed_tokens=null（工作量未知）；异常继续向上传播。
-            # 失败锁定避免调用方在未完成 KV 上直接重试。
+            # 模型返回后的逐 item 提交也在同一事务内：postprocess 抛错同样
+            # 触发批次回滚与全活动收尾（§4.3 异常安全目标——forward、采样、
+            # postprocess 或资源记账异常都不泄漏资源）
+            self.scheduler.postprocess(items, token_ids)
+        except BaseException as original_error:
+            # 模型/采样/postprocess/记账异常（§4.3/§5.4）：Engine 异常后明确
+            # 不可重试。每个清理步骤独立隔离，任何清理异常都不能遮蔽原始异常，
+            # 也不能阻止后续 abort_all_active 继续释放其余请求。
             self._execution_failed = True
-            _log_event({
-                "event": "engine_round", "round_id": round_id, "phase": phase,
-                "token_budget": budget, "planned_tokens": planned,
-                "executed_tokens": None, "model_called": True, "outcome": "error",
-                "prefill_chunks": prefill_item_count,
-                "prefill_items": prefill_item_count,
-                "decode_items": decode_count,
-                "prefill_tokens": prefill_tokens, "decode_tokens": decode_count,
-                "observed_at": perf_counter(),
-            })
-            raise
+            round_snapshot = None
+            final_snapshot = None
+            cleanup_errors = []
+
+            try:
+                _log_event({
+                    "event": "engine_round", "round_id": round_id, "phase": phase,
+                    "token_budget": budget, "planned_tokens": planned,
+                    "executed_tokens": None, "model_called": True, "outcome": "error",
+                    "prefill_chunks": prefill_item_count,
+                    "prefill_items": prefill_item_count,
+                    "decode_items": decode_count,
+                    "prefill_tokens": prefill_tokens, "decode_tokens": decode_count,
+                    "observed_at": perf_counter(),
+                })
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            try:
+                round_snapshot = self.scheduler.abort_round(items, reason="engine_error")
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            try:
+                # 即使本轮对象清理失败，也必须继续清理等待/运行/暂停请求。
+                final_snapshot = self.scheduler.abort_all_active(reason="engine_error")
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            try:
+                self.scheduler.block_manager.check_ledger()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            try:
+                _log_event({
+                    "event": "engine_abort_summary", "round_id": round_id,
+                    "reason": "engine_error", "execution_failed": True,
+                    "round_snapshot": round_snapshot,
+                    "final_snapshot": final_snapshot,
+                    "cleanup_errors": len(cleanup_errors),
+                    "observed_at": perf_counter(),
+                })
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            for cleanup_error in cleanup_errors:
+                logger.error("Engine 异常清理失败（原始异常将保留）: %r", cleanup_error)
+            raise original_error
+        finally:
+            # 幂等兜底（不变量 6/9）：无论成功或异常，本轮临时计划不得跨轮
+            # 残留；状态和轮次标记也通过控制锁复位，避免与外部控制面并发写入。
+            with self.scheduler._control_lock:
+                for it in items:
+                    it.seq.num_scheduled_tokens = 0
+                self.scheduler._current_round_id = None
         # 正常返回：executed 取自调用前快照（模型实际输入 query token 数），
         # 即使 postprocess 因取消/超时丢弃采样输出，已执行输入仍计入本轮预算
         executed = planned
@@ -193,7 +352,6 @@ class LLMEngine:
             "prefill_tokens": prefill_tokens, "decode_tokens": decode_count,
             "observed_at": perf_counter(),
         })
-        self.scheduler.postprocess(items, token_ids)
         # 只把正常完成的请求当作 completion 汇报；
         # CANCELLED/TIMEOUT 请求由后续 API 层根据 finish_reason 决定响应
         outputs = [(it.seq.seq_id, it.seq.completion_token_ids) for it in items
@@ -230,14 +388,15 @@ class LLMEngine:
                 if paused:
                     raise RuntimeError(
                         "generate() 无法推进：存在暂停（PREEMPTED）请求，而同步驱动"
-                        "没有恢复机制。请先调用 scheduler.resume() 或 cancel_request()"
+                        "没有恢复机制。请先调用 scheduler.resume() 或 "
+                        "engine.cancel_request()"
                         f" 处理这些请求后再重新驱动: {paused}"
                     )
                 raise RuntimeError(
                     "generate() 无法推进：活动请求本轮无可执行候选（通常是 KV 容量"
                     "不足以接纳等待队列队首且无 running 请求可推进）。"
                     "请增大 num_kvcache_blocks / gpu_memory_utilization，或调用 "
-                    f"scheduler.cancel_request() 移除无法容纳的请求。活动请求: "
+                    f"engine.cancel_request() 移除无法容纳的请求。活动请求: "
                     f"{[seq.request_id for seq in self.scheduler.requests.values()]}"
                 )
             # Day9：吞吐按分阶段计划量计算（num_tokens 不再用符号编码阶段，

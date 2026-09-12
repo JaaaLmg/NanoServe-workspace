@@ -58,6 +58,18 @@ EOS = 999_999  # 测试中不会出现的 token id，配合 ignore_eos 使用
 # 真实运行时由 LLMEngine 设置（nanovllm/engine/llm_engine.py），测试手动对齐
 Sequence.block_size = BLOCK_SIZE
 
+# Day10：Sequence 构造校验 deadline >= created_at（单调时钟，§4.1/§6.2）。
+# 本文件在虚拟时间轴上注入小数值 now（如 10.0/12.0），因此把 Sequence.clock
+# 注入为固定 0.0，使 created_at 与虚拟时间轴同轴、构造校验可确定性通过；
+# fixture 结束时恢复真实时钟，避免跨测试泄漏。
+@pytest.fixture(autouse=True)
+def _fixed_sequence_clock():
+    original = Sequence.clock
+    Sequence.clock = staticmethod(lambda: 1.0)
+    yield
+    Sequence.clock = original
+
+
 WAITING = SequenceStatus.WAITING
 RUNNING = SequenceStatus.RUNNING
 PREEMPTED = SequenceStatus.PREEMPTED
@@ -619,16 +631,18 @@ class TestDecodeSideEffects:
             batch, items, is_prefill = schedule_round(sched, now=float(t))
             sched.postprocess(items, tokens_for_items(items, 7), now=float(t))
         assert a.num_tokens == 10 and b.num_tokens == 9
-        # 下一轮 decode：b（len=9，写位置 8 需新块）池已空 -> 抢占 b
+        # 下一轮 decode：b（len=9，写位置 8 需新块）池已空且 running 中无合法
+        # victim -> Day10 延后语义：b 保留 RUNNING 与已提交 KV 回队首原位，
+        # 不做无谓自抢占（自抢占不释放新容量，只会损失有效 KV 进度）
         stats_before = sched.budget_deferred_request_rounds_total
         batch, items, is_prefill = schedule_round(sched, now=10.0)
         assert is_prefill is False
         assert [it.seq.seq_id for it in items] == [a.seq_id]
         db = decision_of(sched.last_schedule_stats, b)
         assert db["reason"] == "kv_capacity"
-        assert b.num_preempts == 1
-        assert b.status == WAITING
-        assert not b.block_table
+        assert b.num_preempts == 0
+        assert b.status == RUNNING
+        assert b.block_table
         assert sched.last_schedule_stats["budget_deferred_requests"] == 0
         # b 从未因预算被延后：没有预算等待记录
         assert b.seq_id not in sched.budget_wait

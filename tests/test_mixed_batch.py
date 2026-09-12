@@ -48,6 +48,18 @@ EOS = 999_999  # 测试中不会出现的 token id，配合 ignore_eos 使用
 # 真实运行时由 LLMEngine 设置（nanovllm/engine/llm_engine.py），测试手动对齐
 Sequence.block_size = BLOCK_SIZE
 
+# Day10：Sequence 构造校验 deadline >= created_at（单调时钟，§4.1/§6.2）。
+# 本文件在虚拟时间轴上注入小数值 now（如 10.0/12.0），因此把 Sequence.clock
+# 注入为固定 0.0，使 created_at 与虚拟时间轴同轴、构造校验可确定性通过；
+# fixture 结束时恢复真实时钟，避免跨测试泄漏。
+@pytest.fixture(autouse=True)
+def _fixed_sequence_clock():
+    original = Sequence.clock
+    Sequence.clock = staticmethod(lambda: 1.0)
+    yield
+    Sequence.clock = original
+
+
 WAITING = SequenceStatus.WAITING
 RUNNING = SequenceStatus.RUNNING
 PREEMPTED = SequenceStatus.PREEMPTED
@@ -625,22 +637,31 @@ class TestRunnerSubBatchContract:
                                      "planned_tokens": 2}
         with pytest.raises(ValueError, match="decode item 的接纳数必须为 1"):
             engine.step()
-        # seq_id 重复
-        dup1 = BatchItem(seq=good, phase="decode", scheduled_tokens=1,
+        # 每次计划校验失败都会锁定该 Engine；后续 malformed case 使用独立
+        # Engine，保持失败锁语义而不让测试依赖同一实例重试。
+        sched2 = make_scheduler(max_num_batched_tokens=32)
+        engine2, calls2 = self.make_engine(sched2)
+        good2 = make_seq(4, max_tokens=4)
+        dup1 = BatchItem(seq=good2, phase="decode", scheduled_tokens=1,
                          needs_sample=True, round_id=99)
-        dup2 = BatchItem(seq=good, phase="decode", scheduled_tokens=1,
+        dup2 = BatchItem(seq=good2, phase="decode", scheduled_tokens=1,
                          needs_sample=True, round_id=99)
-        sched.schedule = lambda **kw: ([dup1, dup2], "decode")
+        sched2.schedule = lambda **kw: ([dup1, dup2], "decode")
+        sched2.last_schedule_stats = {"round_id": 99, "token_budget": 32,
+                                      "planned_tokens": 2}
         with pytest.raises(ValueError, match="seq_id 重复"):
-            engine.step()
-        # 未知 phase
-        weird = BatchItem(seq=good, phase="prefill", scheduled_tokens=2,
+            engine2.step()
+        sched3 = make_scheduler(max_num_batched_tokens=32)
+        engine3, calls3 = self.make_engine(sched3)
+        good3 = make_seq(4, max_tokens=4)
+        weird = BatchItem(seq=good3, phase="train", scheduled_tokens=2,
                           needs_sample=False, round_id=99)
-        weird.phase = "train"
-        sched.schedule = lambda **kw: ([weird], "train")
+        sched3.schedule = lambda **kw: ([weird], "train")
+        sched3.last_schedule_stats = {"round_id": 99, "token_budget": 32,
+                                      "planned_tokens": 2}
         with pytest.raises(ValueError, match="未知 phase"):
-            engine.step()
-        assert calls == []  # 模型从未被调用
+            engine3.step()
+        assert calls == [] and calls2 == [] and calls3 == []  # 模型从未被调用
 
 
 # ============================== KV 与资源 ==============================
@@ -702,9 +723,10 @@ class TestMixedKVAndResources:
         assert c.status == WAITING and c.prefill_offset == 7
         assert a.block_table == [] and c.block_table   # a 释放、c 持有
 
-    def test_kv_shortage_decode_preempts_prefill_stops(self):
-        """KV 不足：decode 侧抢占（kv_capacity）、prefill 侧停止接纳（同原因），
-        两种来源独立于预算归因。"""
+    def test_kv_shortage_decode_defers_prefill_stops(self):
+        """KV 不足：decode 侧无合法 victim 时延后（Day10 §4.2.2 规则 5：候选保留
+        RUNNING/KV 回队首原位，不再做无谓的自抢占）；延后原因记 kv_capacity，
+        独立于预算归因。prefill 侧停止接纳与 victim 抢占由请求控制测试覆盖。"""
         sched = make_scheduler(num_blocks=3, max_num_batched_tokens=10 ** 6)
         a = make_seq(8, max_tokens=5)   # len=9 时 decode 需第 2 块
         sched.add(a)
@@ -716,16 +738,19 @@ class TestMixedKVAndResources:
         items, phase = sched.schedule(now=2.0)
         assert phase == "mixed"
         sched.postprocess(items, tokens_for(items), now=2.0)
-        # 下一轮：b.len=9 写位置 8 需新块，free=0 -> running 中仅剩 b 可牺牲：
-        # b 被抢占（preempt+resume 回 waiting 队首），本轮仅 a decode
+        # 下一轮：decode a（len=10）不需要新块，正常接纳；decode b（len=9）
+        # 写位置 8 需新块且 free=0、running 中无合法 victim -> b 延后：
+        # 保留 RUNNING 与已提交 KV 回到队首原位，不抢占、不释放
         items, phase = sched.schedule(now=3.0)
         db = decision_of(sched.last_schedule_stats, b)
         assert db["reason"] == "kv_capacity"
-        assert b.num_preempts == 1 and b.status == WAITING
-        assert not b.block_table
+        assert b.num_preempts == 0
+        assert b.status == RUNNING and b.block_table
         assert [it.seq.seq_id for it in items] == [a.seq_id]
-        # prefill 阶段：b 重算需要 2 块 > free 0，同样记 kv_capacity（无重复决策）
+        # KV 原因不算预算拒绝（决策归因与预算统计独立）
         assert sched.last_schedule_stats["budget_deferred_requests"] == 0
+        assert b.seq_id not in sched.budget_wait
+        sched.block_manager.check_ledger()
 
 
 # ============================== 生命周期（混合轮） ==============================
@@ -976,17 +1001,28 @@ class TestMixedRandomScenario:
                     sched.postprocess(stale_items, tokens, now=now)
             # 驱动一轮
             running_before = [s.seq_id for s in sched.running]
+            preempt_counts = {s.seq_id: s.num_preempts for s in sched.running}
             items, phase = sched.schedule(now=now)
             assert_mixed_round_invariants(sched, items, phase)
             # decode-first：轮前 RUNNING 请求要么被 decode 接纳，要么因 KV 不足
-            # 被抢占让块（合法例外），不允许因预算/名额被延后
+            # 让块（合法例外：有 victim 时被抢占回 waiting；无 victim 时延后、
+            # 保留 RUNNING/KV 且必须有 kv_capacity 归因，Day10 §4.2.2 规则 5），
+            # 不允许因预算/名额被延后
             decode_ids = [it.seq.seq_id for it in items if it.phase == "decode"]
-            preempted = []
+            preempted, kv_deferred = [], []
             for sid in running_before:
+                if sid in decode_ids:
+                    continue   # 已被本轮 decode 接纳（可能已完成并被收尾）
                 s = sched.requests.get(sid)
                 if s is None or (s.status == WAITING and s.num_preempts > 0):
                     preempted.append(sid)
-            assert set(decode_ids) | set(preempted) == set(running_before)
+                elif s.status == RUNNING:
+                    d = decision_of(sched.last_schedule_stats, s)
+                    assert d["reason"] == "kv_capacity"
+                    assert s.num_preempts == preempt_counts[sid], "延后不应伴随抢占"
+                    kv_deferred.append(sid)
+            assert (set(decode_ids) | set(preempted) | set(kv_deferred)
+                    == set(running_before))
             # phase_priority 全仓库无残留（随机流程中不应出现未知原因）
             for d in sched.last_schedule_stats["decisions"]:
                 if d["reason"] == "decode_priority":

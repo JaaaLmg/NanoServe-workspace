@@ -1,11 +1,13 @@
 import json
 import logging
+import threading
 from collections import deque
 from dataclasses import dataclass
 from time import perf_counter
 
 from nanovllm.config import Config, validate_positive_int
-from nanovllm.engine.sequence import Sequence, SequenceStatus
+from nanovllm.engine.sequence import (InvalidStateTransition, Sequence,
+                                      SequenceStatus)
 from nanovllm.engine.block_manager import BlockManager
 
 # 模块级 logger：库代码不做 basicConfig，日志开关由调用方（验收脚本/服务层）控制
@@ -140,6 +142,16 @@ class Scheduler:
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        # Day10 控制锁（§3.4）：保护控制面状态（cancel_requested/cancel_reason/
+        # requests 索引/队列）与资源账本变更的线性化。request_cancel 信号入口与
+        # schedule/postprocess 安全点都在锁内执行控制面读写；锁不跨越 GPU forward
+        # （ModelRunner 调用发生在 Engine 的两次安全点之间，不持锁），因此外部取消
+        # 不会阻塞在 kernel 上，也不会在 kernel 使用对象期间清空 block table。
+        # RLock：安全点内部嵌套调用 cancel/timeout/preempt 等入口需要可重入。
+        self._control_lock = threading.RLock()
+        # Scheduler 默认读取真实单调时钟；测试通过各公开入口的 now 参数
+        # 注入确定性时间，避免与外部直接构造的绝对 deadline 发生时间轴冲突。
+        self._clock = perf_counter
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         # 活动请求索引（seq_id -> Sequence）：取消/超时按 id 定位，免于遍历队列。
@@ -187,15 +199,16 @@ class Scheduler:
         - 活动 request_id 必须唯一（自动 ID 与自定义 ID 一视同仁），
           否则取消/查询无法唯一定位请求。
         """
-        if seq.status != SequenceStatus.WAITING:
-            raise ValueError(f"仅接纳 WAITING 请求，当前状态为 {seq.status.name}")
-        if seq.seq_id in self.requests:
-            raise ValueError(f"seq_id={seq.seq_id} 的活动请求已存在，禁止重复添加")
-        if seq.request_id in self._active_request_ids:
-            raise ValueError(f"request_id={seq.request_id!r} 的活动请求已存在，禁止重复注册")
-        self.requests[seq.seq_id] = seq
-        self._active_request_ids.add(seq.request_id)
-        self._enqueue_waiting(seq)
+        with self._control_lock:
+            if seq.status != SequenceStatus.WAITING:
+                raise ValueError(f"仅接纳 WAITING 请求，当前状态为 {seq.status.name}")
+            if seq.seq_id in self.requests:
+                raise ValueError(f"seq_id={seq.seq_id} 的活动请求已存在，禁止重复添加")
+            if seq.request_id in self._active_request_ids:
+                raise ValueError(f"request_id={seq.request_id!r} 的活动请求已存在，禁止重复注册")
+            self.requests[seq.seq_id] = seq
+            self._active_request_ids.add(seq.request_id)
+            self._enqueue_waiting(seq)
 
     def _enqueue_waiting(self, seq: Sequence, *, front: bool = False):
         """只接纳 WAITING 请求进入等待队列，并防止重复入队。"""
@@ -237,30 +250,95 @@ class Scheduler:
     def _finalize(self, seq: Sequence, now: float | None = None):
         """终态收尾：移出所有队列 + 释放资源 + 从活动索引删除（幂等）。
 
-        所有权保护：只有当请求仍登记在活动索引中（本次调用拥有该记录）时，
-        才移除索引并清除其 request_id 唯一性标记。否则"旧对象的延迟/重复
-        收尾"（如对早已完成的批次重复执行 postprocess）会误删复用了同一
-        request_id 的新请求的身份记录，破坏活动 ID 唯一性。
-        资源释放与队列移除本身幂等，对非所有者调用是安全的空操作。
-        预算等待统计同受所有权保护：终态摘要/episode 结算只在拥有记录时执行一次，
-        重复收尾不会重复累计或删除新对象的记录。
+        活动索引的对象身份是唯一所有权凭证。旧批次或其他 Scheduler 的对象
+        不得借用同一 seq_id 触碰当前队列和 KV 账本；真正 owner 的重复收尾
+        仍由 block_table 清空保证幂等。
         """
-        owned = self.requests.get(seq.seq_id) is seq
+        if self.requests.get(seq.seq_id) is not seq:
+            return
         self._remove_from_queues(seq)
         self._release_sequence(seq)
-        if owned:
-            del self.requests[seq.seq_id]
-            self._active_request_ids.discard(seq.request_id)
-            # Day8 chunk 计数随请求终态回收（seq_id 全局唯一，记录不会误伤新请求）
-            self._prefill_chunk_count.pop(seq.seq_id, None)
-            # 终态预算收尾：结算未关闭 episode、发终态等待摘要并删除记录
-            self._settle_terminal_budget_stats(seq, now)
+        del self.requests[seq.seq_id]
+        self._active_request_ids.discard(seq.request_id)
+        # Day8 chunk 计数随请求终态回收（seq_id 全局唯一，记录不会误伤新请求）
+        self._prefill_chunk_count.pop(seq.seq_id, None)
+        # 终态预算收尾：结算未关闭 episode、发终态等待摘要并删除记录
+        self._settle_terminal_budget_stats(seq, now)
 
-    # ---------- 控制入口：取消 / 超时 / 抢占 / 恢复 ----------
+    # ---------- 控制入口：取消 / 超时 / 抢占 / 恢复（Day10 §3.4/§4.2） ----------
+    #
+    # 两层取消语义：
+    # - request_cancel() 是控制面信号：只在锁内置位标记，允许在 ModelRunner
+    #   forward 期间被外部线程调用，不触碰 block/队列/token；
+    # - cancel() 是安全点收尾：要求调度器不在执行当前模型批次，执行终态迁移、
+    #   队列移除、KV 释放和活动索引删除。Engine 对外取消入口优先使用信号语义。
+
+    def request_cancel(self, seq_id: int, reason: str = "client_cancelled") -> bool:
+        """控制面取消信号：只在锁内置位 cancel_requested 与首次 cancel_reason。
+
+        - 找不到活动请求或已终态：返回 False；
+        - 重复调用返回 True，但保持首次记录的原因（Sequence.request_cancel）；
+        - 不迁移状态、不动队列、不释放 block、不改 token，因此可以安全地
+          在模型执行期间调用；真正收尾发生在调度边界/postprocess 安全点。
+        """
+        with self._control_lock:
+            seq = self.requests.get(seq_id)
+            if seq is None or seq.is_terminal:
+                return False
+            return seq.request_cancel(reason)
+
+    def request_cancel_by_request_id(self, request_id: str,
+                                     reason: str = "client_cancelled") -> bool:
+        """按 request_id 原子地发出取消信号，消除查找后再按 seq_id 操作的竞态。"""
+        with self._control_lock:
+            seq = next((item for item in self.requests.values()
+                        if item.request_id == request_id), None)
+            if seq is None or seq.is_terminal:
+                return False
+            return seq.request_cancel(reason)
+
+    def get_request(self, request_id: str) -> Sequence | None:
+        """在控制锁内按 request_id 读取活动请求。"""
+        with self._control_lock:
+            return next((seq for seq in self.requests.values()
+                         if seq.request_id == request_id), None)
+
+    def _log_control_event(self, action: str, seq: Sequence, from_status: SequenceStatus,
+                           reason: str, released_blocks: int, now: float,
+                           *, free_before: int | None = None,
+                           used_before: int | None = None):
+        """发出可独立重算的 request_control 事件。
+
+        before/after 账本快照让验收脚本可以验证 ``released_blocks`` 的真实差值，
+        而不是只相信动作代码传入的计划值；事件仍不含 prompt 或 token 明文。
+        """
+        free_after = len(self.block_manager.free_block_ids)
+        used_after = len(self.block_manager.used_block_ids)
+        if free_before is None:
+            free_before = free_after
+        if used_before is None:
+            used_before = used_after
+        _log_event({
+            "event": "request_control",
+            "round_id": self._current_round_id,
+            "seq_id": seq.seq_id,
+            "request_id": seq.request_id,
+            "action": action,
+            "from_status": from_status.name,
+            "to_status": seq.status.name,
+            "reason": reason,
+            "num_preempts": seq.num_preempts,
+            "released_blocks": released_blocks,
+            "free_blocks_before": free_before,
+            "used_blocks_before": used_before,
+            "free_blocks": free_after,
+            "used_blocks": used_after,
+            "observed_at": now,
+        })
 
     def cancel(self, seq_id: int, reason: str = "client_cancelled",
                now: float | None = None) -> bool:
-        """取消请求（统一入口）：设置终态、移出队列并释放资源。
+        """安全点取消收尾：设置终态、移出队列并释放资源（幂等）。
 
         - 请求不存在返回 False；请求已是终态时返回 False，
           但仍会幂等完成剩余清理（终态对象被外部 mark_* 留在队列/索引中时，
@@ -268,55 +346,94 @@ class Scheduler:
         - 首次记录的取消原因不被后续重复取消覆盖；
         - 与 TIMEOUT 的区分保留在 finish_reason 中，便于指标统计；
         - 终态时刻即预算 episode 结算时刻（显式 now 优先，否则读同一单调时钟）。
+        每次调用发出 request_control 事件（含终态重放的幂等调用，便于审计
+        重复取消不覆盖原因）。
         """
-        seq = self.requests.get(seq_id)
-        if seq is None:
-            return False
-        if seq.is_terminal:
+        if now is None:
+            now = self._clock()
+        with self._control_lock:
+            seq = self.requests.get(seq_id)
+            if seq is None:
+                return False
+            from_status = seq.status
+            if seq.is_terminal:
+                free_before = len(self.block_manager.free_block_ids)
+                used_before = len(self.block_manager.used_block_ids)
+                self._finalize(seq, now)
+                self._log_control_event(
+                    "cancel", seq, from_status, seq.finish_reason or reason,
+                    used_before - len(self.block_manager.used_block_ids), now,
+                    free_before=free_before, used_before=used_before)
+                return False
+            # 先打标记（原因只记录首次），再以记录下来的原因做终态迁移
+            seq.request_cancel(reason)
+            seq.mark_cancelled(seq.cancel_reason or reason, now=now)
+            free_before = len(self.block_manager.free_block_ids)
+            used_before = len(self.block_manager.used_block_ids)
             self._finalize(seq, now)
-            return False
-        # 先打标记（原因只记录首次），再以记录下来的原因做终态迁移
-        seq.request_cancel(reason)
-        seq.mark_cancelled(seq.cancel_reason or reason, now=now)
-        self._finalize(seq, now)
-        return True
+            self._log_control_event(
+                "cancel", seq, from_status, seq.cancel_reason or reason,
+                used_before - len(self.block_manager.used_block_ids), now,
+                free_before=free_before, used_before=used_before)
+            return True
 
     def timeout(self, seq_id: int, now: float | None = None,
                 reason: str = "deadline_exceeded") -> bool:
-        """超时终止（统一入口）：语义与 cancel 相同但 finish_reason 不同。"""
-        seq = self.requests.get(seq_id)
-        if seq is None:
-            return False
-        if seq.is_terminal:
+        """安全点超时收尾：已有取消信号优先于 deadline。"""
+        if now is None:
+            now = self._clock()
+        with self._control_lock:
+            seq = self.requests.get(seq_id)
+            if seq is None:
+                return False
+            # 取消和超时同时到达时，客户端显式意图优先；统一转入 cancel
+            # 入口，避免直接 mark_timeout 绕过优先级契约。
+            if seq.cancel_requested and not seq.is_terminal:
+                return self.cancel(seq_id, reason=seq.cancel_reason or reason, now=now)
+            from_status = seq.status
+            free_before = len(self.block_manager.free_block_ids)
+            used_before = len(self.block_manager.used_block_ids)
+            if seq.is_terminal:
+                self._finalize(seq, now)
+                self._log_control_event(
+                    "timeout", seq, from_status, seq.finish_reason or reason,
+                    used_before - len(self.block_manager.used_block_ids), now,
+                    free_before=free_before, used_before=used_before)
+                return False
+            seq.mark_timeout(reason, now=now)
             self._finalize(seq, now)
-            return False
-        seq.mark_timeout(reason, now=now)
-        self._finalize(seq, now)
-        return True
+            self._log_control_event(
+                "timeout", seq, from_status, seq.finish_reason or reason,
+                used_before - len(self.block_manager.used_block_ids), now,
+                free_before=free_before, used_before=used_before)
+            return True
 
     def check_deadlines(self, now: float | None = None) -> list[Sequence]:
         """在调度边界统一执行 deadline 检查，返回本轮超时的请求。
 
         以活动索引为扫描范围（覆盖队列成员与暂停请求），使用单调时钟；
         带取消标记的请求跳过——取消优先于超时（客户端显式意图优先），
-        由 _purge_cancelled 按 CANCELLED 处理。
+        由 _purge_cancelled 按 CANCELLED 处理。同一轮只取一次时钟，
+        便于确定性测试（注入 now）。
         """
         if now is None:
-            now = perf_counter()
-        timed_out = []
-        for seq in list(self.requests.values()):
-            if seq.cancel_requested or seq.is_terminal:
-                continue
-            if seq.deadline is not None and now >= seq.deadline:
-                self.timeout(seq.seq_id, now=now)
-                timed_out.append(seq)
-        return timed_out
+            now = self._clock()
+        with self._control_lock:
+            timed_out = []
+            for seq in list(self.requests.values()):
+                if seq.cancel_requested or seq.is_terminal:
+                    continue
+                if seq.deadline is not None and now >= seq.deadline:
+                    self.timeout(seq.seq_id, now=now)
+                    timed_out.append(seq)
+            return timed_out
 
     def _purge_cancelled(self, now: float | None = None) -> list[Sequence]:
         """调度边界安全检查：处理模型执行期间被置位取消标记的请求。
 
         取消可能发生在一次模型执行前后（未来 HTTP/SSE 为异步），
         也可能作用于暂停中的请求；扫描范围是活动索引而非队列。
+        仅在已持锁的调度路径内调用。
         """
         cancelled = []
         for seq in list(self.requests.values()):
@@ -332,6 +449,7 @@ class Scheduler:
         不做兜底会导致终态请求再次参与调度：WAITING 中的会先分配 block 再在
         迁移时抛异常，RUNNING 中的会再次进入 decode（违反不变量 1/5）。
         结算时刻使用"Scheduler 首次观察时刻"（传入的 now），不倒填外部时间。
+        仅在已持锁的调度路径内调用。
         """
         finalized = []
         for seq in list(self.requests.values()):
@@ -339,6 +457,42 @@ class Scheduler:
                 self._finalize(seq, now)
                 finalized.append(seq)
         return finalized
+
+    # ---------- Day10 抢占：victim 选择与恢复事务（§4.2.2/§5.3） ----------
+
+    def _pick_victim(self, exclude_seq_ids: set[int],
+                     tried_seq_ids: set[int]) -> Sequence | None:
+        """按固定策略选择抢占 victim：running 队尾优先，向队首反向搜索。
+
+        合法 victim 条件（§4.2.2 规则 1 的三条排除）：
+        - 状态为 RUNNING（终态/等待/暂停对象不可抢占）且仍在 running 队列；
+        - 不是本轮已接纳的 BatchItem 对象（exclude_seq_ids，含同轮已接纳的
+          decode item 与最后 chunk prefill item）；
+        - 无本轮执行计划（num_scheduled_tokens == 0，不是正在执行的对象）。
+        tried_seq_ids 排除本轮已尝试过的候选：尝试次数天然有界（<= len(running)），
+        不会无界循环。没有合法候选返回 None，由调用方延后/停止，不破坏队列。
+        """
+        for victim in reversed(self.running):
+            if victim.seq_id in exclude_seq_ids or victim.seq_id in tried_seq_ids:
+                continue
+            if victim.status is not SequenceStatus.RUNNING or victim.is_terminal:
+                continue
+            if victim.num_scheduled_tokens > 0:
+                continue
+            return victim
+        return None
+
+    def _preempt_victim(self, victim: Sequence, decided: set[int],
+                        decisions: list[RoundDecision], now: float, phase: str):
+        """自动抢占事务：先完成释放（PREEMPTED + 移出队列 + 释放 block），
+        再恢复为 WAITING 插入 waiting 队首（同轮自动路径，§3.3 规则）。
+        事件中保留一次抢占记录；victim 以 prefill recompute 身份重新排队。"""
+        self.preempt(victim, now=now)
+        self.resume(victim, now=now)
+        decided.add(victim.seq_id)
+        decisions.append(RoundDecision(
+            victim.seq_id, victim.request_id, REASON_KV_CAPACITY,
+            kv_checked=True, phase=phase))
 
     def preempt(self, seq: Sequence, now: float | None = None):
         """抢占：RUNNING -> PREEMPTED，释放 KV block（不回滚已生成 token）。
@@ -348,24 +502,147 @@ class Scheduler:
         恢复采用 recompute 方案：物理块释放，token 进度保留，恢复时重新 prefill。
         显式抢占同时结束该请求的预算等待 episode：此后等待原因为 paused/KV，
         不应继续计入预算等待。
+        非法抢占（对 WAITING/终态对象重复调用）经统一迁移入口显式抛异常，
+        不产生任何队列/资源副作用。
         """
         if now is None:
-            now = perf_counter()
-        seq.transition_to(SequenceStatus.PREEMPTED)
-        seq.is_prefill = True
-        self._remove_from_queues(seq)
-        self._release_sequence(seq)
-        self._update_budget_wait(seq, deferred=False, now=now,
-                                 round_id=self._current_round_id, close_reason="preempted")
+            now = self._clock()
+        with self._control_lock:
+            if self.requests.get(seq.seq_id) is not seq:
+                raise ValueError(
+                    f"只能抢占当前 Scheduler 活动请求: "
+                    f"request_id={getattr(seq, 'request_id', None)!r}")
+            if seq not in self.running:
+                # 已注册对象但状态/队列不满足抢占前置条件，交给状态机统一
+                # 抛出显式非法迁移，保持既有调用方的错误契约。
+                raise InvalidStateTransition(
+                    seq, seq.status, SequenceStatus.PREEMPTED, "request not in running")
+            from_status = seq.status
+            free_before = len(self.block_manager.free_block_ids)
+            used_before = len(self.block_manager.used_block_ids)
+            # 迁移时间与注入时钟统一（不变量 11）：last_preempted_at 使用
+            # 调用方注入的 now，与事件 observed_at 同源
+            seq.transition_to(SequenceStatus.PREEMPTED, now=now)
+            seq.is_prefill = True
+            self._remove_from_queues(seq)
+            self._release_sequence(seq)
+            self._update_budget_wait(seq, deferred=False, now=now,
+                                     round_id=self._current_round_id, close_reason="preempted")
+            self._log_control_event(
+                "preempt", seq, from_status, "kv_capacity",
+                used_before - len(self.block_manager.used_block_ids), now,
+                free_before=free_before, used_before=used_before)
 
-    def resume(self, seq: Sequence):
+    def resume(self, seq: Sequence, now: float | None = None):
         """恢复被抢占请求：只允许 PREEMPTED -> WAITING，重新入队等待 recompute。
 
         front=True 使被抢占请求排在等待队列头部（沿用原抢占行为的优先级）。
+        恢复不修改逻辑 token 进度（prompt/completion/采样参数），
+        有效 KV 进度保持抢占时归零的状态，由重新 prefill 重建。
         """
-        seq.transition_to(SequenceStatus.WAITING)
-        seq.is_prefill = True
-        self._enqueue_waiting(seq, front=True)
+        if now is None:
+            now = self._clock()
+        with self._control_lock:
+            if self.requests.get(seq.seq_id) is not seq:
+                raise ValueError(
+                    f"只能恢复当前 Scheduler 活动索引中的请求: "
+                    f"request_id={getattr(seq, 'request_id', None)!r}")
+            if seq.status is not SequenceStatus.PREEMPTED:
+                # 先让状态机报告重复/非法恢复，保持既有异常契约；该调用
+                # 对非法迁移不会产生任何状态或资源副作用。
+                seq.transition_to(SequenceStatus.WAITING, now=now)
+            if seq in self.waiting or seq in self.running:
+                raise ValueError(
+                    f"恢复请求已存在于工作队列，拒绝制造重复成员: "
+                    f"request_id={getattr(seq, 'request_id', None)!r}")
+            from_status = seq.status
+            seq.transition_to(SequenceStatus.WAITING, now=now)
+            seq.is_prefill = True
+            self._enqueue_waiting(seq, front=True)
+            self._log_control_event("resume", seq, from_status, "recompute_resume", 0, now)
+
+    # ---------- Day10 异常收尾（§4.2.3/§4.3） ----------
+
+    def _resource_snapshot(self) -> dict:
+        """资源快照：活动请求/队列/账本计数，供异常收尾日志与验收交叉核对。"""
+        return {
+            "active_requests": len(self.requests),
+            "waiting": len(self.waiting),
+            "running": len(self.running),
+            "free_blocks": len(self.block_manager.free_block_ids),
+            "used_blocks": len(self.block_manager.used_block_ids),
+        }
+
+    def _abort_one(self, seq: Sequence, reason: str, now: float):
+        """单个对象的异常收尾（幂等，可重入）：活动则迁移 CANCELLED 再统一 _finalize。
+
+        所有权保护：仅当对象仍登记在活动索引中才做终态迁移——旧批次迟到收尾
+        不能把复用了同一 seq_id 的新请求误标记为 CANCELLED；_finalize 自带
+        所有权检查，对非所有者是安全空操作。已终态对象不覆盖既有 finish_reason。
+        """
+        if self.requests.get(seq.seq_id) is not seq:
+            return
+        from_status = seq.status
+        if not seq.is_terminal:
+            seq.mark_cancelled(reason, now=now)
+        free_before = len(self.block_manager.free_block_ids)
+        used_before = len(self.block_manager.used_block_ids)
+        self._finalize(seq, now)
+        self._log_control_event(
+            "abort", seq, from_status, reason,
+            used_before - len(self.block_manager.used_block_ids), now,
+            free_before=free_before, used_before=used_before)
+
+    def abort_round(self, items, reason: str = "engine_error",
+                    now: float | None = None) -> dict:
+        """批次异常收尾（§4.2.3）：清除本轮计划并把本轮对象收敛到终态。
+
+        - 仍活动且归属当前索引的 item：取消其本轮计划（num_scheduled_tokens
+          清零，不伪造为已执行），迁移 CANCELLED（finish_reason=reason，如
+          engine_error/execution_error），释放其全部 block；
+        - 已终态对象：只执行幂等 _finalize，不覆盖既有原因；
+        - 非所有者（旧批次迟到对象）：_finalize 为安全空操作，不影响新对象；
+        - 返回收尾后的资源快照，供错误日志与测试核对。
+        异常清理可重复调用，不 double free、不重复删除索引（不变量 9）。
+        """
+        if now is None:
+            now = self._clock()
+        with self._control_lock:
+            errors = []
+            for it in items:
+                try:
+                    self._abort_one(it.seq, reason, now)
+                except BaseException as exc:
+                    errors.append(exc)
+            snapshot = self._resource_snapshot()
+            if errors:
+                raise RuntimeError(
+                    f"批次异常收尾失败 {len(errors)} 项，资源快照={snapshot}") from errors[0]
+            return snapshot
+
+    def abort_all_active(self, reason: str = "engine_error",
+                         now: float | None = None) -> dict:
+        """全活动请求异常收尾：Engine 模型执行异常后不可重试，等待/运行/暂停
+        中的请求都不能留下"看似可继续"的活动对象（§4.3 step 事务第 4 步）。
+
+        与 abort_round 相同的迁移与释放规则；返回收尾后的资源快照。
+        可重复调用（幂等）。
+        """
+        if now is None:
+            now = self._clock()
+        with self._control_lock:
+            errors = []
+            # 快照保证清理期间即使某个对象异常，也继续处理其余活动请求。
+            for seq in list(self.requests.values()):
+                try:
+                    self._abort_one(seq, reason, now)
+                except BaseException as exc:
+                    errors.append(exc)
+            snapshot = self._resource_snapshot()
+            if errors:
+                raise RuntimeError(
+                    f"活动请求异常收尾失败 {len(errors)} 项，资源快照={snapshot}") from errors[0]
+            return snapshot
 
     # ---------- Day7：预算等待统计（§5.2/§5.3） ----------
 
@@ -432,7 +709,7 @@ class Scheduler:
         结算未关闭 episode -> 发终态等待摘要 -> 删除记录（有界保存，§5.3/§6.3）。
         """
         if now is None:
-            now = perf_counter()
+            now = self._clock()
         stats = self.budget_wait.get(seq.seq_id)
         if stats is not None and stats.budget_wait_started_at is not None:
             self._update_budget_wait(
@@ -673,39 +950,54 @@ class Scheduler:
                         needed_tokens=1, phase="decode"))
                 break
             seq = self.running.popleft()
+            # Day10 §4.2.2：块不足时按"队尾优先、反向搜索、有限尝试"选择合法
+            # victim 抢占让块；victim 排除本轮已接纳 item（admitted_ids，含已
+            # 接纳的 decode item 与最后 chunk prefill item）、终态对象和已有
+            # 本轮执行计划的对象。抢占释放后重新查询 can_append，仍不足则
+            # 继续选下一个候选（tried 保证有界），无合法 victim 时延后候选。
+            admitted_ids = {it.seq.seq_id for it in items}
+            tried: set[int] = set()
+            deferred = False
             while not self.block_manager.can_append(seq):
-                # 块不足：抢占合法 RUNNING 请求释放资源（KV 原因，不算预算拒绝）。
-                # preempt 只做抢占，resume 立即让它以 WAITING 身份回到等待队列
-                if self.running:
-                    victim = self.running.pop()
-                    self.preempt(victim, now=now)
-                    self.resume(victim)
-                    decided.add(victim.seq_id)
-                    decisions.append(RoundDecision(
-                        victim.seq_id, victim.request_id, REASON_KV_CAPACITY,
-                        kv_checked=True, phase="decode"))
-                else:
-                    self.preempt(seq, now=now)
-                    self.resume(seq)
-                    decided.add(seq.seq_id)
-                    decisions.append(RoundDecision(
-                        seq.seq_id, seq.request_id, REASON_KV_CAPACITY,
-                        needed_tokens=1, kv_checked=True, phase="decode"))
+                victim = self._pick_victim(admitted_ids, tried)
+                if victim is None:
+                    # 无合法 victim（§4.2.2 规则 5）：延后候选，不破坏队列——
+                    # 候选保留 RUNNING/KV 回到队首原位，下一轮容量允许时直接
+                    # 继续 decode。不做 Day9 的"自抢占"：自抢占不释放任何新
+                    # 容量（自己释放又自己重算），只会白白损失有效 KV 进度。
+                    deferred = True
                     break
-            else:
-                seq.num_scheduled_tokens = 1
-                seq.is_prefill = False
-                self.block_manager.may_append(seq)
-                used += 1
+                self._preempt_victim(victim, decided, decisions, now, phase="decode")
+            if deferred:
+                self.running.appendleft(seq)
                 decided.add(seq.seq_id)
                 decisions.append(RoundDecision(
-                    seq.seq_id, seq.request_id, REASON_SCHEDULED,
-                    needed_tokens=1, scheduled_tokens=1, kv_checked=True,
-                    phase="decode"))
-                items.append(BatchItem(
-                    seq=seq, phase="decode", scheduled_tokens=1,
-                    offset_before=None, is_last_chunk=False,
-                    needs_sample=True, round_id=round_id))
+                    seq.seq_id, seq.request_id, REASON_KV_CAPACITY,
+                    needed_tokens=1, kv_checked=True, phase="decode"))
+                # FCFS 停止：队首无法推进，其余未考察成员按 HOL 归因
+                # （它们未被独立检查，归因跟随队首的 kv_capacity）
+                for blocked in list(self.running):
+                    if blocked.seq_id in decided:
+                        continue
+                    decided.add(blocked.seq_id)
+                    decisions.append(RoundDecision(
+                        blocked.seq_id, blocked.request_id, REASON_HEAD_OF_LINE,
+                        blocking_reason=REASON_KV_CAPACITY,
+                        blocked_by_seq_id=seq.seq_id, phase="decode"))
+                break
+            seq.num_scheduled_tokens = 1
+            seq.is_prefill = False
+            self.block_manager.may_append(seq)
+            used += 1
+            decided.add(seq.seq_id)
+            decisions.append(RoundDecision(
+                seq.seq_id, seq.request_id, REASON_SCHEDULED,
+                needed_tokens=1, scheduled_tokens=1, kv_checked=True,
+                phase="decode"))
+            items.append(BatchItem(
+                seq=seq, phase="decode", scheduled_tokens=1,
+                offset_before=None, is_last_chunk=False,
+                needs_sample=True, round_id=round_id))
         # 沿用既有规则：已选择的 decode 批次恢复至 running 队首；
         # 延后请求保持相对顺序跟在后面，不引入轮转公平策略
         self.running.extendleft(reversed([it.seq for it in items]))
@@ -727,9 +1019,16 @@ class Scheduler:
         "D > 0 且 needed_first <= B"——needed_first 是本轮首个被考察的 prefill
         候选的需求（含未被接纳即停止的情形），不是被延后候选自己的需求。
         时间语义：整轮使用一次单调时钟 now（可注入确定值用于测试）。
+
+        控制锁（Day10 §3.4）：整轮调度是纯 CPU 记账的安全点，全程持锁保证
+        与外部 request_cancel 信号及账本变更线性化；锁不跨越 GPU forward。
         """
         if now is None:
-            now = perf_counter()
+            now = self._clock()
+        with self._control_lock:
+            return self._schedule(now=now)
+
+    def _schedule(self, *, now: float) -> tuple[list[BatchItem], str]:
         # 每轮唯一单调 round_id；空轮也分配并记录
         self._round_counter += 1
         round_id = self._current_round_id = self._round_counter
@@ -801,7 +1100,25 @@ class Scheduler:
                 break
             num_cached_blocks, needed = self._estimate_prefill_tokens(seq)
             if needed is None:
-                # KV 容量不足：停止 prefill 接纳（KV 原因，与预算延后区分）
+                # KV 容量不足（§4.2.2 规则 5/§5.3）：先按固定策略抢占 running
+                # victim 释放容量，再对同一候选重新查询 can_allocate（"C 重新
+                # 查询容量并继续调度"）。victim 恢复为 WAITING 并插入 waiting
+                # 队首（优先重算），队首插入使扫描索引整体后移一位，因此每次
+                # 插入后 scan += 1 补偿，保证后续迭代仍指向同一候选及其后继。
+                # tried 集合保证尝试次数有界（<= len(running)），不无界循环。
+                admitted_ids = {it.seq.seq_id for it in items}
+                tried: set[int] = set()
+                while needed is None:
+                    victim = self._pick_victim(admitted_ids, tried)
+                    if victim is None:
+                        break
+                    tried.add(victim.seq_id)
+                    self._preempt_victim(victim, decided, decisions, now, phase="decode")
+                    scan += 1  # waiting 队首插入的扫描索引补偿
+                    num_cached_blocks, needed = self._estimate_prefill_tokens(seq)
+            if needed is None:
+                # 无合法 victim 或释放后仍不足：停止 prefill 接纳（KV 原因，
+                # 与预算延后区分），不得破坏队列
                 self._attribute_prefill_stop(decisions, decided, reason=REASON_KV_CAPACITY,
                                              needed=None, kv_checked=True)
                 break
@@ -905,9 +1222,17 @@ class Scheduler:
         - 原子性/幂等（沿用 Day8 §4.5）：先整批校验再逐个提交；取消/超时/终态
           不推进 offset；提交后立即校验单调有界；重复/迟到收尾被拒。
         - 混合轮新增约束：单个 item 的终态不影响同轮其他 item 的提交。
+
+        控制锁（Day10 §3.4）：postprocess 是模型返回后的 CPU 记账安全点，全程
+        持锁保证与外部 request_cancel 信号线性化；锁不跨越 GPU forward。
         """
         if now is None:
-            now = perf_counter()
+            now = self._clock()
+        with self._control_lock:
+            return self._postprocess(items, token_ids, now=now)
+
+    def _postprocess(self, items: list[BatchItem], token_ids: list[int] | None, *,
+                     now: float):
         seqs = [it.seq for it in items]
         # 含活动请求标记：round 关联校验与 token 数校验共用同一谓词（审查 §4.2）
         has_live = any(not s.is_terminal for s in seqs)
@@ -957,12 +1282,13 @@ class Scheduler:
                 self._finalize(seq, now)
                 continue
             if seq.cancel_requested:
-                seq.mark_cancelled(seq.cancel_reason or "client_cancelled", now=now)
-                self._finalize(seq, now)
+                # 取消优先于超时优先于正常提交（§4.4）：走统一 cancel 入口，
+                # 终态迁移 + 队列/索引/资源收尾与 request_control 事件同源
+                self.cancel(seq.seq_id, reason=seq.cancel_reason or "client_cancelled", now=now)
                 continue
             if seq.deadline is not None and now >= seq.deadline:
-                seq.mark_timeout("deadline_exceeded", now=now)
-                self._finalize(seq, now)
+                # 模型执行期间跨过 deadline：丢弃本轮采样，按 TIMEOUT 终止
+                self.timeout(seq.seq_id, now=now)
                 continue
             # ---------- 原子提交（成功路径，prefill/decode 统一） ----------
             offset_before = seq.prefill_offset
