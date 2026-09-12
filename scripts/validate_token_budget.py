@@ -49,18 +49,22 @@ ENGINE_LOGGER = logging.getLogger("nanovllm.engine.llm_engine")
 
 EVENT_FIELDS = {
     "scheduler_round": {"event", "round_id", "phase", "token_budget", "max_num_seqs",
-                        "planned_tokens", "scheduled_requests", "budget_deferred_direct",
-                        "budget_deferred_hol", "budget_deferred_requests",
-                        "observed_at", "decisions"},
+                        "planned_tokens", "prefill_tokens", "decode_tokens",
+                        "prefill_items", "decode_items", "scheduled_requests",
+                        "needed_first",
+                        "budget_deferred_direct", "budget_deferred_hol",
+                        "budget_deferred_requests", "observed_at", "decisions"},
     "engine_round": {"event", "round_id", "phase", "token_budget", "planned_tokens",
-                     "executed_tokens", "model_called", "outcome", "observed_at"},
+                     "executed_tokens", "model_called", "outcome", "observed_at",
+                     "prefill_chunks", "prefill_items", "decode_items",
+                     "prefill_tokens", "decode_tokens"},
     "budget_wait_episode": {"event", "seq_id", "request_id", "started_at", "ended_at",
                             "duration_seconds", "close_reason", "round_id", "observed_at"},
     "request_budget_wait": {"event", "seq_id", "request_id", "budget_deferred_rounds",
                             "budget_wait_seconds", "status", "finish_reason", "round_id", "observed_at"},
 }
 KNOWN_REASONS = {"scheduled", "budget", "sequence_cap", "kv_capacity",
-                 "head_of_line", "phase_priority", "paused"}
+                 "head_of_line", "decode_priority", "paused"}
 
 
 class JsonlCapture(logging.Handler):
@@ -110,8 +114,10 @@ class FixedClock:
 
 def make_stub_runner(sampled_token: int = 7):
     """ModelRunner 桩：不加载权重，固定返回采样 token（ignore_eos 下由 max_tokens 终止）。"""
-    def call(method, seqs, is_prefill):
-        return [sampled_token] * len(seqs)
+    def call(method, items_):
+        # Day9 契约：按 needs_sample 快照返回采样 token（无采样轮返回 None）
+        out = [sampled_token for it in items_ if it.needs_sample]
+        return out if out else None
     return call
 
 
@@ -138,8 +144,8 @@ def build_cpu_engine(token_budget: int, max_num_seqs: int, num_blocks: int = 64,
     def schedule_with_clock(**kwargs):
         return real_schedule(now=clock.tick())
 
-    def postprocess_with_clock(seqs, token_ids, is_prefill, **kwargs):
-        return real_postprocess(seqs, token_ids, is_prefill, now=clock.now())
+    def postprocess_with_clock(items_, token_ids, **kwargs):
+        return real_postprocess(items_, token_ids, now=clock.now())
 
     sched.schedule = schedule_with_clock          # type: ignore[assignment]
     sched.postprocess = postprocess_with_clock    # type: ignore[assignment]
@@ -182,7 +188,8 @@ def cpu_requests():
 def gpu_requests(token_budget: int, max_new_tokens: int, block_size: int):
     """GPU 固定请求集：含 B-1/B/B+1、跨多轮分块、prefix 复用与 decode 数量大于预算。
 
-    - decode 证据：短请求数量随预算扩展（始终 > B），保证存在 decode 预算延后；
+    - 让路证据：短请求数量随预算扩展（始终 > B），保证存在 decode_priority
+      让路轮与 prefill 预算延后（Day9 decode-first 下 decode 不再被预算延后）；
     - prefix 证据：共享前缀覆盖 2 个完整物理块（首块可缓存、末块按协议不缓存），
       第二条请求的 needed 应为 共享长度 - block_size（只计实际未缓存 token）。
     """
@@ -328,8 +335,12 @@ def summarize(capture: JsonlCapture, sched: Scheduler, mode: str) -> tuple[bool,
     engine_rounds = [e for e in events if e.get("event") == "engine_round"]
     completed = [e for e in engine_rounds if e.get("outcome") == "completed"]
     max_executed = max((e["executed_tokens"] for e in completed), default=0)
-    decode_deferred = [e for e in rounds
-                       if e["phase"] == "decode" and e["budget_deferred_requests"] > 0]
+    # Day9：decode-first 保证 decode 候选不被预算延后（正常流程结构性不可达）；
+    # 预算延后证据改由 waiting prefill 候选承担，另要求存在 decode_priority
+    # 让路轮（decode-first 策略生效的独立证据）
+    decode_priority_rounds = [e for e in rounds
+                              if any(d["reason"] == "decode_priority"
+                                     for d in e.get("decisions", []))]
     free = len(sched.block_manager.free_block_ids)
     used = len(sched.block_manager.used_block_ids)
     lines = [
@@ -338,11 +349,13 @@ def summarize(capture: JsonlCapture, sched: Scheduler, mode: str) -> tuple[bool,
         f"[{mode}] 预算延后: 唯一请求 {sched.budget_deferred_unique_requests_total} 个 / "
         f"请求-轮次 {sched.budget_deferred_request_rounds_total} 次 / "
         f"已结算等待 {sched.budget_wait_closed_seconds_total:.3f} 秒",
-        f"[{mode}] decode 受预算分批证据: {len(decode_deferred)} 轮存在 budget 延后",
+        f"[{mode}] decode-first 让路证据: {len(decode_priority_rounds)} 轮存在 decode_priority",
         f"[{mode}] 结束时 KV block free/used: {free}/{used}",
     ]
-    if not decode_deferred:
-        problems.append("没有 decode 轮因预算延后：缺少 decode 预算生效证据")
+    if not decode_priority_rounds:
+        problems.append("没有 decode_priority 轮：缺少 decode-first 让路证据")
+    if not any(e["budget_deferred_requests"] > 0 for e in rounds):
+        problems.append("没有任何预算延后轮：缺少预算约束生效证据")
     ok = not problems
     lines.append(f"[{mode}] 校验结果: {'PASS' if ok else 'FAIL'}")
     lines += [f"  - {p}" for p in problems]

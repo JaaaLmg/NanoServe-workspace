@@ -10,6 +10,11 @@
 用 SimpleNamespace 构造；LLMEngine 通过 __new__ 跳过需要 GPU 的 __init__，
 仅验证与调度器相关的控制面逻辑。
 
+Day9 适配说明（docs/mixed-prefill-decode.md）：schedule() 返回 (items, phase)、
+postprocess() 逐 item 提交；共享前缀等"已 RUNNING + 新 waiting"场景的轮次
+变为混合轮（decode 在前、prefill 在后），断言按 item 序列改写。
+状态机、控制面与序列化协议的断言原样保持。
+
 重复执行命令：
     python -m pytest tests/test_request_lifecycle.py -q
 """
@@ -66,10 +71,25 @@ def make_scheduler(num_blocks: int = 8, max_num_batched_tokens: int = 10**6) -> 
     return Scheduler(config)
 
 
+def schedule_round(sched: Scheduler, *args, **kwargs):
+    """Day9 适配：schedule() 返回 (items, phase)；展开为 (seqs, items, is_prefill)。
+
+    items 是 Day9 postprocess 的入参（携带 needs_sample 快照与 round_id）；
+    is_prefill 仅服务旧断言（phase == "prefill"，decode/mixed 轮为 False）。
+    """
+    items, phase = sched.schedule(*args, **kwargs)
+    return [it.seq for it in items], items, phase == "prefill"
+
+
+def tokens_for_items(items, token: int) -> list[int]:
+    """按 Day9 提交契约构造 postprocess 的 token 注入列表（按 needs_sample 快照对齐）。"""
+    return [token for it in items if it.needs_sample]
+
+
 def run_round(sched: Scheduler, sampled_token_ids: list[int]):
     """执行一轮 schedule + postprocess，模拟一次引擎 step（不含模型）。"""
-    seqs, is_prefill = sched.schedule()
-    sched.postprocess(seqs, sampled_token_ids, is_prefill)
+    seqs, items, is_prefill = schedule_round(sched)
+    sched.postprocess(items, sampled_token_ids)
     return seqs, is_prefill
 
 
@@ -234,7 +254,7 @@ class TestSchedulerBasics:
     def test_empty_queues_schedule_nothing(self):
         """空队列不会调度，返回空批次而不是崩溃。"""
         sched = make_scheduler()
-        seqs, is_prefill = sched.schedule()
+        seqs, items, is_prefill = schedule_round(sched)
         assert seqs == [] and is_prefill is False
         assert sched.is_finished()
 
@@ -251,7 +271,7 @@ class TestSchedulerBasics:
         sched = make_scheduler()
         seq = make_seq(4, max_tokens=4)
         sched.add(seq)
-        seqs, is_prefill = sched.schedule()
+        seqs, items, is_prefill = schedule_round(sched)
         assert is_prefill is True and seqs == [seq]
         assert seq.status == RUNNING
         assert list(sched.running) == [seq]
@@ -310,7 +330,7 @@ class TestCancellation:
         assert sched.is_finished()
 
         # 取消后的请求不参与调度
-        seqs, is_prefill = sched.schedule()
+        seqs, items, is_prefill = schedule_round(sched)
         assert seqs == []
         assert len(bm.free_block_ids) == 8
 
@@ -324,7 +344,7 @@ class TestCancellation:
 
         assert sched.cancel(seq.seq_id) is True
         assert seq.status == CANCELLED and seq.block_table == []
-        seqs, _ = sched.schedule()
+        seqs, items, _ = schedule_round(sched)
         assert seqs == []
         assert sched.is_finished()
 
@@ -334,13 +354,13 @@ class TestCancellation:
         seq = make_seq(4, max_tokens=8)
         sched.add(seq)
         run_round(sched, [100])                      # prefill
-        seqs, is_prefill = sched.schedule()          # decode 批次已选出
+        seqs, items, is_prefill = schedule_round(sched)          # decode 批次已选出
         assert is_prefill is False
 
         # "模型执行期间"客户端置位取消标记（只打标记，不迁移）
         assert seq.request_cancel("client_disconnected") is True
 
-        sched.postprocess(seqs, [5555], is_prefill)  # 本轮采样的 token 必须被丢弃
+        sched.postprocess(items, [5555])  # 本轮采样的 token 必须被丢弃
         assert 5555 not in seq.token_ids             # 取消之后的 token 未追加
         assert seq.status == CANCELLED
         assert seq.finish_reason == "client_disconnected"
@@ -378,7 +398,7 @@ class TestTimeout:
         seq = make_seq(4, max_tokens=4, deadline=perf_counter() - 1)  # 已过期
         sched.add(seq)
 
-        seqs, _ = sched.schedule()  # schedule 内部执行 deadline 检查
+        seqs, items, _ = schedule_round(sched)  # schedule 内部执行 deadline 检查
         assert seqs == []
         assert seq.status == TIMEOUT
         assert seq.finish_reason == "deadline_exceeded"
@@ -425,11 +445,11 @@ class TestPreemption:
         sched.add(a)
         sched.add(b)
 
-        seqs, is_prefill = sched.schedule()      # prefill 两条，空闲块耗尽
+        seqs, items, is_prefill = schedule_round(sched)      # prefill 两条，空闲块耗尽
         assert is_prefill is True and seqs == [a, b]
-        sched.postprocess(seqs, [7000, 7001], True)
+        sched.postprocess(items, [7000, 7001])
 
-        seqs, is_prefill = sched.schedule()      # decode：b 被抢占让块给 a
+        seqs, items, is_prefill = schedule_round(sched)      # decode：b 被抢占让块给 a
         assert is_prefill is False and seqs == [a]
         # b 经历了 PREEMPTED -> WAITING（resume 在同一次调度内完成）
         assert b.status == WAITING
@@ -457,8 +477,8 @@ class TestPreemption:
         for _ in range(20):
             if sched.is_finished():
                 break
-            seqs, is_prefill = sched.schedule()
-            sched.postprocess(seqs, [8000 + i for i in range(len(seqs))], is_prefill)
+            seqs, items, is_prefill = schedule_round(sched)
+            sched.postprocess(items, tokens_for_items(items, 8000))
 
         assert sched.is_finished()
         assert b.is_finished and b.num_completion_tokens == 3
@@ -520,8 +540,8 @@ class TestInvariants:
         sched.cancel(b.seq_id)
         rounds = 0
         while not sched.is_finished():
-            seqs, is_prefill = sched.schedule()
-            sched.postprocess(seqs, [9000] * len(seqs), is_prefill)
+            seqs, items, is_prefill = schedule_round(sched)
+            sched.postprocess(items, tokens_for_items(items, 9000))
             rounds += 1
             assert rounds < 20
 
@@ -631,9 +651,10 @@ class TestEngineStepEmptyBatch:
         engine.scheduler = make_scheduler(num_blocks=8)
         calls = []
 
-        def fake_call(method, seqs, is_prefill):
-            calls.append((method, len(seqs), is_prefill))
-            return [100 + i for i in range(len(seqs))]
+        def fake_call(method, items_):
+            calls.append((method, len(items_)))
+            out = tokens_for_items(items_, 100)
+            return out if out else None
 
         engine.model_runner = SimpleNamespace(call=fake_call)
         return engine, calls
@@ -671,7 +692,7 @@ class TestEngineStepEmptyBatch:
             step_outputs, _ = engine.step()
             outputs.extend(step_outputs)
 
-        assert calls and all(n > 0 for _, n, _ in calls)   # 从未出现空批次
+        assert calls and all(n > 0 for _, n in calls)      # 从未出现空批次
         assert outputs == [(seq.seq_id, [100, 100])]       # stub 每轮注入同一 token
         assert seq.status == FINISHED and seq.finish_reason == "length"
 
@@ -686,12 +707,12 @@ class TestPostprocessDeadline:
         sched = make_scheduler(num_blocks=8)
         seq = make_seq(4, max_tokens=1, deadline=perf_counter() + 3600)
         sched.add(seq)
-        batch, is_prefill = sched.schedule()          # 调度时尚未超时
+        batch, items, is_prefill = schedule_round(sched)          # 调度时尚未超时
         assert is_prefill is True
 
         # 模型执行期间跨过 deadline，且本轮采样 token 恰好达到 max_tokens
         now = seq.deadline + 1
-        sched.postprocess(batch, [42], is_prefill, now=now)
+        sched.postprocess(items, [42], now=now)
 
         assert seq.status == TIMEOUT
         assert seq.finish_reason == "deadline_exceeded"
@@ -708,11 +729,11 @@ class TestPostprocessDeadline:
                        deadline=perf_counter() + 3600)
         sched.add(seq)
 
-        batch, is_prefill = sched.schedule()
-        sched.postprocess(batch, [200], is_prefill)   # prefill（真实时钟未超时）
-        batch, is_prefill = sched.schedule()
+        batch, items, is_prefill = schedule_round(sched)
+        sched.postprocess(items, [200])   # prefill（真实时钟未超时）
+        batch, items, is_prefill = schedule_round(sched)
         assert is_prefill is False
-        sched.postprocess(batch, [eos], is_prefill, now=seq.deadline + 1)  # 采样到 EOS 同轮超时
+        sched.postprocess(items, [eos], now=seq.deadline + 1)  # 采样到 EOS 同轮超时
 
         assert seq.status == TIMEOUT                  # 不是 FINISHED/stop
         assert seq.finish_reason == "deadline_exceeded"
@@ -721,12 +742,12 @@ class TestPostprocessDeadline:
         sched = make_scheduler(num_blocks=8, max_num_batched_tokens=2)
         seq = make_seq(6, max_tokens=4, deadline=perf_counter() + 3600)
         sched.add(seq)
-        batch, is_prefill = sched.schedule()          # 第 1 个 chunk，仍为 WAITING
+        batch, items, is_prefill = schedule_round(sched)          # 第 1 个 chunk，仍为 WAITING
         assert is_prefill is True and seq.status == WAITING
 
         # Day8 提交契约：中间 chunk 执行不产生采样 token（真实 runner 返回 None）；
         # 即使 deadline 已过，安全路径同样丢弃输出、不推进 offset，按 TIMEOUT 终止
-        sched.postprocess(batch, [], is_prefill, now=seq.deadline + 1)
+        sched.postprocess(items, [], now=seq.deadline + 1)
 
         assert seq.status == TIMEOUT
         assert seq.block_table == []                  # 已分配的 chunk block 被回收
@@ -737,10 +758,10 @@ class TestPostprocessDeadline:
         sched = make_scheduler(num_blocks=8)
         seq = make_seq(4, max_tokens=8, deadline=perf_counter() + 3600)
         sched.add(seq)
-        batch, is_prefill = sched.schedule()
+        batch, items, is_prefill = schedule_round(sched)
         seq.request_cancel("client_gone")             # 取消标记与过期 deadline 同时存在
 
-        sched.postprocess(batch, [42], is_prefill, now=seq.deadline + 1)
+        sched.postprocess(items, [42], now=seq.deadline + 1)
 
         assert seq.status == CANCELLED                # 取消优先于超时
         assert seq.finish_reason == "client_gone"
@@ -756,7 +777,7 @@ class TestTerminalPurgeAtScheduleBoundary:
         run_round(sched, [10])                        # prefill -> RUNNING
         seq.mark_timeout()                            # 公开方法，绕过 Scheduler 入口
 
-        batch, _ = sched.schedule()
+        batch, items, _ = schedule_round(sched)
         assert batch == []                            # 终态请求不再进入 decode
         assert seq.status == TIMEOUT
         assert seq.block_table == []
@@ -769,7 +790,7 @@ class TestTerminalPurgeAtScheduleBoundary:
         sched.add(seq)
         seq.mark_cancelled("external")                # WAITING 中被外部置为终态
 
-        batch, _ = sched.schedule()                   # 不得先分配 block 再抛迁移异常
+        batch, items, _ = schedule_round(sched)                   # 不得先分配 block 再抛迁移异常
         assert batch == []
         assert seq.block_table == []
         assert len(bm.free_block_ids) == 8            # 资源从未分配
@@ -795,7 +816,7 @@ class TestTerminalPurgeAtScheduleBoundary:
         run_round(sched, [10])
         seq.mark_finished("stop")
 
-        batch, _ = sched.schedule()
+        batch, items, _ = schedule_round(sched)
         assert batch == [] and seq.block_table == [] and sched.is_finished()
 
 
@@ -867,7 +888,7 @@ class TestPausedRequests:
         sched.preempt(seq)
         seq.deadline = perf_counter() - 1             # 暂停期间 deadline 过期
 
-        batch, _ = sched.schedule()                   # 扫描范围为活动索引，覆盖暂停请求
+        batch, items, _ = schedule_round(sched)                   # 扫描范围为活动索引，覆盖暂停请求
         assert batch == []
         assert seq.status == TIMEOUT
         assert sched.requests == {} and sched.is_finished()
@@ -880,7 +901,7 @@ class TestPausedRequests:
         sched.preempt(seq)
         seq.request_cancel("gone")
 
-        batch, _ = sched.schedule()
+        batch, items, _ = schedule_round(sched)
         assert batch == []
         assert seq.status == CANCELLED and seq.finish_reason == "gone"
         assert sched.is_finished()
@@ -895,8 +916,8 @@ class TestPausedRequests:
         assert seq.status == WAITING
 
         while not sched.is_finished():
-            batch, is_prefill = sched.schedule()
-            sched.postprocess(batch, [60 + i for i in range(len(batch))], is_prefill)
+            batch, items, is_prefill = schedule_round(sched)
+            sched.postprocess(items, tokens_for_items(items, 60))
 
         assert seq.is_finished
         assert seq.token_ids[seq.num_prompt_tokens:] == [10, 60]  # 进度未丢失
@@ -965,8 +986,11 @@ class TestSharedPrefixCancellation:
         sched.add(a)
         run_round(sched, [10])                        # a prefill，block0 哈希登记
         sched.add(b)
-        batch, is_prefill = sched.schedule()          # b 命中 a 的前缀块
-        assert is_prefill is True and batch == [b]
+        # Day9 decode-first：a 已 RUNNING，本轮先 decode a，再接纳 b 的 prefill
+        # （b 命中 a 的前缀块，共享 ref_count=2）
+        batch, items, is_prefill = schedule_round(sched)
+        assert [(it.phase, it.seq.seq_id) for it in items] == [
+            ("decode", a.seq_id), ("prefill", b.seq_id)]
         assert b.num_cached_tokens == 8
         assert b.block_table[0] == a.block_table[0]
         shared = a.block_table[0]
@@ -977,8 +1001,8 @@ class TestSharedPrefixCancellation:
         assert b.block_table[0] == shared
 
         while not sched.is_finished():
-            batch, is_prefill = sched.schedule()
-            sched.postprocess(batch, [30 + i for i in range(len(batch))], is_prefill)
+            batch, items, is_prefill = schedule_round(sched)
+            sched.postprocess(items, tokens_for_items(items, 30))
 
         assert b.is_finished
         assert bm.blocks[shared].ref_count == 0       # 最后持有者完成后回收
@@ -1029,7 +1053,8 @@ class TestStaleCleanupIdOwnership:
             encode=lambda text: [ord(c) % 100 + 1 for c in text],
             decode=lambda tokens: "stub",
         )
-        engine.model_runner = SimpleNamespace(call=lambda m, seqs, prefill: [10] * len(seqs))
+        engine.model_runner = SimpleNamespace(
+            call=lambda m, items_: tokens_for_items(items_, 10))
         return engine
 
     @pytest.mark.parametrize("ending", ["cancel", "finish"])
@@ -1038,12 +1063,12 @@ class TestStaleCleanupIdOwnership:
         rid = engine.add_request([1, 2], SamplingParams(max_tokens=1, ignore_eos=True),
                                  request_id="same")
         a = engine.get_request(rid)
-        batch, is_prefill = engine.scheduler.schedule()
+        batch, items, is_prefill = schedule_round(engine.scheduler)
 
         if ending == "cancel":
             engine.cancel_request(rid)                    # A 取消，ID 标记释放
         else:
-            engine.scheduler.postprocess(batch, [10], is_prefill)  # A 正常完成
+            engine.scheduler.postprocess(items, [10])  # A 正常完成
         assert a.is_terminal
 
         # 复用 ID 注册 B（公开允许的策略）
@@ -1053,7 +1078,7 @@ class TestStaleCleanupIdOwnership:
         assert b is not a and b.request_id == "same"
 
         # 对 A 的旧批次执行延迟（cancel 路径）/重复（finish 路径）后处理
-        engine.scheduler.postprocess(batch, [10], is_prefill)
+        engine.scheduler.postprocess(items, [10])
 
         # B 的身份记录不受旧对象收尾影响
         assert engine.get_request("same") is b
@@ -1101,7 +1126,7 @@ class TestGeneratePausedContract:
             encode=lambda text: [ord(c) % 100 + 1 for c in text],
             decode=lambda tokens: "stub",
         )
-        engine.model_runner = SimpleNamespace(call=lambda m, seqs, prefill: [7] * len(seqs))
+        engine.model_runner = SimpleNamespace(call=lambda m, items_: tokens_for_items(items_, 7))
         return engine
 
     @staticmethod

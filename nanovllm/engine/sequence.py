@@ -210,6 +210,18 @@ class Sequence:
         return self.prefill_offset >= self.prefill_target
 
     @property
+    def is_last_chunk_scheduled(self) -> bool:
+        """本轮接纳即完成 prefill：offset + q == target（Day9 起该判定的单一权威）。
+
+        Day8 中该判定在 scheduler/model_runner/engine/测试/脚本重复出现 5 处
+        （day8-review §4.5），收敛为此具名只读谓词以避免混合批次下判定漂移。
+        语义与原判定逐位一致：仅对带有待执行计划（num_scheduled_tokens > 0）的
+        prefill 请求消费；decode 请求的 q 恒为 1 且 target 随 num_tokens 增长，
+        结果恰好也为 True（历史口径一致），但调用方不应依赖该巧合。
+        """
+        return self.prefill_offset + self.num_scheduled_tokens == self.prefill_target
+
+    @property
     def num_cached_tokens(self) -> int:
         """Day7 兼容只读视图：历史上该字段混用"prefix 命中量"与"已执行进度"
         两个语义，Day8 起统一到 prefill_offset 单一事实源，这里仅返回其当前值，

@@ -6,6 +6,10 @@ hash_blocks 记账）、复用（prefix cache）、释放（FINISHED）与 preem
 不加载模型：schedule()/postprocess() 是纯 CPU 逻辑，本轮采样 token 由测试
 直接注入（真实运行时由 ModelRunner + Sampler 产生）。Scheduler 只读取
 Config 的少数字段，用 SimpleNamespace 即可构造，避免依赖模型目录。
+
+Day9 适配说明（docs/mixed-prefill-decode.md）：schedule() 返回 (items, phase)、
+postprocess() 逐 item 提交；token 注入按 needs_sample 快照对齐。
+KV 申请/写入/复用/释放/抢占路径的断言原样保持。
 """
 
 from types import SimpleNamespace
@@ -41,6 +45,21 @@ def make_seq(num_tokens: int, max_tokens: int) -> Sequence:
     )
 
 
+def schedule_round(sched: Scheduler, *args, **kwargs):
+    """Day9 适配：schedule() 返回 (items, phase)；展开为 (seqs, items, is_prefill)。
+
+    items 是 Day9 postprocess 的入参（携带 needs_sample 快照与 round_id）；
+    is_prefill 仅服务旧断言（phase == "prefill"，decode/mixed 轮为 False）。
+    """
+    items, phase = sched.schedule(*args, **kwargs)
+    return [it.seq for it in items], items, phase == "prefill"
+
+
+def tokens_for_items(items, token: int) -> list[int]:
+    """按 Day9 提交契约构造 postprocess 的 token 注入列表（按 needs_sample 快照对齐）。"""
+    return [token for it in items if it.needs_sample]
+
+
 class TestFullLifecycle:
     def test_prefill_then_decode_until_finish(self):
         """申请 → 写入（哈希登记）→ decode 增长 → FINISHED 释放。"""
@@ -50,7 +69,7 @@ class TestFullLifecycle:
         sched.add(seq)
 
         # 第 1 轮：完整 prefill
-        seqs, is_prefill = sched.schedule()
+        seqs, items, is_prefill = schedule_round(sched)
         assert is_prefill is True
         assert seqs == [seq]
         assert seq.num_scheduled_tokens == 10
@@ -58,7 +77,7 @@ class TestFullLifecycle:
         assert seq.status == SequenceStatus.RUNNING
         assert list(sched.running) == [seq]
 
-        sched.postprocess(seqs, [5000], True)
+        sched.postprocess(items, [5000])
         assert seq.num_cached_tokens == 10
         assert len(bm.hash_to_block_id) == 1  # 只有完整块 0 登记了哈希
         assert seq.num_completion_tokens == 1
@@ -66,13 +85,13 @@ class TestFullLifecycle:
         assert not seq.is_finished
 
         # 第 2 轮：decode，token 落在原块内，无需新块
-        seqs, is_prefill = sched.schedule()
+        seqs, items, is_prefill = schedule_round(sched)
         assert is_prefill is False
         assert seqs == [seq]
         assert seq.num_scheduled_tokens == 1
         assert len(seq.block_table) == 2
 
-        sched.postprocess(seqs, [5001], False)
+        sched.postprocess(items, [5001])
         assert seq.num_completion_tokens == seq.max_tokens
         assert seq.is_finished  # 达到 max_tokens
         assert seq.block_table == []  # 释放
@@ -91,7 +110,7 @@ class TestFullLifecycle:
         sched.add(seq)
 
         # 第 1 chunk：5 token
-        seqs, is_prefill = sched.schedule()
+        seqs, items, is_prefill = schedule_round(sched)
         assert is_prefill is True
         assert seq.num_scheduled_tokens == 5
         assert len(seq.block_table) == 2  # 整个 prompt 的 2 块一次性分配
@@ -100,28 +119,28 @@ class TestFullLifecycle:
 
         # 中间 chunk：不采样。传入 token 违反提交契约，显式抛错
         with pytest.raises(ValueError, match="需采样请求数"):
-            sched.postprocess(seqs, [6000], True)
-        sched.postprocess(seqs, [], True)
+            sched.postprocess(items, [6000])
+        sched.postprocess(items, [])
         assert seq.num_cached_tokens == 5
         assert seq.num_completion_tokens == 0  # 中间 chunk 不产生任何 token
 
         # 第 2 chunk：5 token
-        seqs, is_prefill = sched.schedule()
+        seqs, items, is_prefill = schedule_round(sched)
         assert is_prefill is True and seq.num_scheduled_tokens == 5
-        sched.postprocess(seqs, [], True)
+        sched.postprocess(items, [])
         assert seq.num_cached_tokens == 10
 
         # 第 3 chunk：最后 2 token，prefill 完成
-        seqs, is_prefill = sched.schedule()
+        seqs, items, is_prefill = schedule_round(sched)
         assert is_prefill is True and seq.num_scheduled_tokens == 2
         assert seq.status == SequenceStatus.RUNNING
-        sched.postprocess(seqs, [6002], True)
+        sched.postprocess(items, [6002])
         assert seq.num_completion_tokens == 1  # prefill 完成时产出首个 completion token
 
         # 第 4 轮：decode 出最后一个 token
-        seqs, is_prefill = sched.schedule()
+        seqs, items, is_prefill = schedule_round(sched)
         assert is_prefill is False
-        sched.postprocess(seqs, [6003], False)
+        sched.postprocess(items, [6003])
         assert seq.is_finished and sched.is_finished()
 
 
@@ -137,9 +156,9 @@ class TestPreemption:
         sched.add(b)
 
         # 一轮 prefill 同时调度 a、b，各占 1 块，空闲块耗尽
-        seqs, is_prefill = sched.schedule()
+        seqs, items, is_prefill = schedule_round(sched)
         assert is_prefill is True and seqs == [a, b]
-        sched.postprocess(seqs, [7000, 7001], True)
+        sched.postprocess(items, [7000, 7001])
         assert len(a.block_table) == 1 and len(b.block_table) == 1
         assert len(bm.free_block_ids) == 0
         b_block = b.block_table[0]
@@ -147,7 +166,7 @@ class TestPreemption:
         # 两条序列长度均为 9：下一个 decode token 都需要 1 个新块（9 % 8 == 1）
 
         # decode 轮：a 在队首被调度；b（队尾）被抢占，其块立即被 a 复用
-        seqs, is_prefill = sched.schedule()
+        seqs, items, is_prefill = schedule_round(sched)
         assert is_prefill is False
         assert seqs == [a]
         # Day6 状态机：抢占路径为 RUNNING -> PREEMPTED ->（resume 同一调用内完成）-> WAITING。
@@ -159,14 +178,14 @@ class TestPreemption:
         assert len(a.block_table) == 2
         assert a.block_table[1] == b_block  # a 复用了 b 刚释放的物理块
 
-        sched.postprocess(seqs, [7002], False)
+        sched.postprocess(items, [7002])
         assert a.num_completion_tokens == 2
         assert not a.is_finished
 
         # 下一轮：b 的 prefill 因 can_allocate == -1 无法进行，只有 a 继续 decode
-        seqs, is_prefill = sched.schedule()
+        seqs, items, is_prefill = schedule_round(sched)
         assert is_prefill is False and seqs == [a]
-        sched.postprocess(seqs, [7003], False)
+        sched.postprocess(items, [7003])
         assert a.is_finished  # a 达到 max_tokens=3
         assert a.block_table == []
         assert len(bm.free_block_ids) == 2  # a 的块全部释放
@@ -176,8 +195,8 @@ class TestPreemption:
         for _ in range(10):
             if sched.is_finished():
                 break
-            seqs, is_prefill = sched.schedule()
-            sched.postprocess(seqs, [8000] * len(seqs), is_prefill)
+            seqs, items, is_prefill = schedule_round(sched)
+            sched.postprocess(items, tokens_for_items(items, 8000))
         assert b.is_finished
         assert b.num_completion_tokens == 3
         assert 7001 in b.token_ids  # 被抢占前生成的 token 仍在
@@ -194,21 +213,21 @@ class TestPrefixReuseAcrossRequests:
         a = Sequence(prompt, sp)
         sched.add(a)
 
-        seqs, is_prefill = sched.schedule()
+        seqs, items, is_prefill = schedule_round(sched)
         assert seqs == [a]
         a_table = list(a.block_table)
-        sched.postprocess(seqs, [4000], True)
+        sched.postprocess(items, [4000])
         assert a.is_finished  # max_tokens=1，prefill 后立即完成
         assert a.block_table == []
         assert len(bm.hash_to_block_id) == 2  # 2 个完整块的哈希保留
 
         c = Sequence(prompt + [9001, 9002], sp)  # 相同前缀 + 2 个新 token
         sched.add(c)
-        seqs, is_prefill = sched.schedule()
+        seqs, items, is_prefill = schedule_round(sched)
         assert is_prefill is True and seqs == [c]
         assert c.num_scheduled_tokens == 2  # 只调度未命中的 2 个 token
         assert c.block_table[:2] == a_table[:2]  # 复用 a 留下的物理块
         assert c.num_cached_tokens == 16
 
-        sched.postprocess(seqs, [4001], True)
+        sched.postprocess(items, [4001])
         assert c.is_finished and sched.is_finished()
