@@ -101,16 +101,25 @@ class LLMEngine:
                 "event": "engine_round", "round_id": round_id, "phase": "idle",
                 "token_budget": budget, "planned_tokens": 0,
                 "executed_tokens": 0, "model_called": False, "outcome": "idle",
+                # 空轮无 prefill 批次：与 decode 轮同为 0，保持 engine_round
+                # 事件字段契约统一（验收脚本白名单要求所有 engine_round 均含该字段）
+                "prefill_chunks": 0,
                 "observed_at": perf_counter(),
             })
             return [], 0
         # 调用前快照：postprocess 会把临时计数清零，不能在其后据此倒推执行工作量；
-        # 因此在模型调用前保存 (seq_id, request_id, n) 与计划总量
-        snapshot = [(seq.seq_id, seq.request_id, seq.num_scheduled_tokens) for seq in seqs]
-        planned = sum(n for _, _, n in snapshot)
+        # 因此在模型调用前保存 (seq_id, request_id, n, offset, is_last_chunk)
+        # 与计划总量。offset/is_last_chunk 为 Day8 chunk 观测字段（仅 rank 0
+        # 统计用途，不进 TP payload）：is_last_chunk 标记该请求本轮 prefill
+        # 是否收尾（决定它是否产出采样 token），供日志关联与迟到结果核对
+        snapshot = [(seq.seq_id, seq.request_id, seq.num_scheduled_tokens,
+                     seq.prefill_offset,
+                     seq.prefill_offset + seq.num_scheduled_tokens == seq.prefill_target)
+                    for seq in seqs]
+        planned = sum(n for _, _, n, _, _ in snapshot)
         # 调用前显式校验批次计数（不依赖会被 python -O 移除的 assert）：
         # 非空批次每个计数必须为正，且总和不超过本轮 token 预算
-        if any(type(n) is not int or n <= 0 for _, _, n in snapshot):
+        if any(type(n) is not int or n <= 0 for _, _, n, _, _ in snapshot):
             raise ValueError(
                 f"round {round_id}: 非空批次存在非正的 num_scheduled_tokens: {snapshot}")
         if planned > budget:
@@ -128,16 +137,19 @@ class LLMEngine:
                 "event": "engine_round", "round_id": round_id, "phase": phase,
                 "token_budget": budget, "planned_tokens": planned,
                 "executed_tokens": None, "model_called": True, "outcome": "error",
+                "prefill_chunks": len(snapshot) if is_prefill else 0,
                 "observed_at": perf_counter(),
             })
             raise
         # 正常返回：executed 取自调用前快照（模型实际输入 query token 数），
         # 即使 postprocess 因取消/超时丢弃采样输出，已执行输入仍计入本轮预算
-        executed = sum(n for _, _, n in snapshot)
+        executed = sum(n for _, _, n, _, _ in snapshot)
         _log_event({
             "event": "engine_round", "round_id": round_id, "phase": phase,
             "token_budget": budget, "planned_tokens": planned,
             "executed_tokens": executed, "model_called": True, "outcome": "completed",
+            # Day8：本轮 prefill 批次的 chunk 数（decode/idle 轮为 0）
+            "prefill_chunks": len(snapshot) if is_prefill else 0,
             "observed_at": perf_counter(),
         })
         self.scheduler.postprocess(seqs, token_ids, is_prefill)

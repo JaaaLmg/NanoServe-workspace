@@ -33,6 +33,10 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    # Day8：单请求单轮 prefill query 上限（chunked prefill 的计算量控制）。
+    # 与 max_num_batched_tokens（全轮预算 B）、kvcache_block_size（物理块粒度）
+    # 是三个独立量，互不对齐、互不替代；初始化后不可热修改。
+    chunk_size: int = 1024
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -44,5 +48,8 @@ class Config:
         # 不进入任何资源分配（资源账本在 Scheduler 中创建，晚于本校验）。
         validate_positive_int(self.max_num_batched_tokens, "max_num_batched_tokens")
         validate_positive_int(self.max_num_seqs, "max_num_seqs")
+        # Day8：chunk_size 复用同一显式校验入口（拒绝 0/负/float/str/bool，
+        # python -O 下仍生效）；无须要求 chunk_size <= B 或与块大小对齐。
+        validate_positive_int(self.chunk_size, "chunk_size")
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

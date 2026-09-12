@@ -1,6 +1,6 @@
 # NanoServe 文档索引
 
-按 `plan.md` 的 20 天计划组织，当前覆盖 **Day 1–7**。本分支从 `dev=555ef43` 创建，并已合并 dev 集成 Day6 实现（提交 `c84e73f`）。Day7 已完成实现与验收，记录见 `day7-validation.md`。
+按 `plan.md` 的 20 天计划组织，当前覆盖 **Day 1–8**。本分支从 `dev=555ef43` 创建，并已合并 dev 集成 Day6 实现（提交 `c84e73f`）。Day7 已完成实现与验收，记录见 `day7-validation.md`；Day8 已在 `feature/chunked-prefill` 分支完成实现，验收记录见 `day8-validation.md`。
 
 ## 按天索引
 
@@ -22,6 +22,10 @@
 - [Day 7 验收记录](./day7-validation.md)：预算/统计/日志实现与 68 项新测试、三档 GPU 预算 sweep、greedy 5/5 一致对比及验收清单逐项核对；原始 JSONL 证据位于 `docs/evidence/day7/`。
 - [Day 7 实现审查](./day7-review.md)：对照设计复核调度逻辑、事件契约、验收工具和证据完整性；记录已补强项与尚未达标边界。
 - [Day 7 Token Budget 教程](./day7-tutorial.md)：面向推理引擎初学者的代码导读——预算口径与账本观、Config 显式校验、prefill/decode 预算调度精读、等待 episode 统计与时间线验算、计划/执行证据链、四个实现缺陷复盘与测试方法。
+- [Day 8 Chunked Prefill 设计](./chunked-prefill.md)：显式 `prefill_offset/chunk_size/prefill_complete` 体系、跨 chunk 位置/attention/KV 提交契约、采样行选择修正、8K 与 greedy 一致性验收及 256/512/1024 性能矩阵。
+- [Day 8 验收记录](./day8-validation.md)：chunked prefill 实现范围、CPU 92 项新测试与全量 259 项回归、GPU 8K 三档分块/greedy 一致性/prefix 命中实测、greedy 数值差异分析与验收清单逐项核对；原始 JSONL 证据位于 `docs/evidence/day8/`。
+- [Day 8 实现审查](./day8-review.md)：对照设计复核 chunk 调度/KV 提交/采样契约与证据完整性；记录审查补强（idle 事件字段、脚本文案）、未闭环的 `runner_input_len` 条款与可读性建议。
+- [Day 8 Chunked Prefill 教程](./day8-tutorial.md)：面向推理引擎初学者的代码导读——从 Day7 隐式分块到显式进度、三个核心概念、扫描位置与队列分离、hash_blocks 显式区间、输入组装与采样契约、原子提交、GPU 一致性证据解读与思考题。
 
 ## 其他
 

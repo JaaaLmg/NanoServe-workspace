@@ -92,11 +92,17 @@ class Sequence:
     block_size = 256
     counter = count()
     # 序列化格式版本：v1 为旧 6 元组（不含控制面字段）；
-    # v2 为 (版本号, 字段名字典)，新增控制面字段且可向后兼容 v1
-    STATE_VERSION = 2
+    # v2 为 (版本号, 字段名字典)，新增控制面字段且可向后兼容 v1；
+    # v3 在 v2 基础上把 num_cached_tokens 字段改名为 prefill_offset
+    # （Day8 单一进度事实源），读取方向兼容 v1/v2
+    STATE_VERSION = 3
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams(),
                  request_id: str | None = None, deadline: float | None = None):
+        # 空 prompt 无法定义 prefill 目标（last_token/prefill 区间均不存在），
+        # 在构造入口显式拒绝，避免调度或模型组装阶段才暴露难排查的错误
+        if not token_ids:
+            raise ValueError("prompt 不能为空：至少需要 1 个 token 才能执行 prefill")
         self.seq_id = next(Sequence.counter)
         # 对外稳定的请求 ID：日志串联、Engine 取消入口使用；保留 seq_id 兼容内部排序
         self.request_id = request_id if request_id is not None else f"req-{self.seq_id}"
@@ -118,7 +124,11 @@ class Sequence:
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
-        self.num_cached_tokens = 0
+        # Day8：prefill 进度的唯一事实源 = 已成功提交到 KV Cache 的有效上下文
+        # token 数。prefix 命中时由 BlockManager.allocate 设为命中块*block_size，
+        # 之后只在 postprocess 成功路径推进（prefill chunk 推进 q，decode 推进 1）。
+        # 释放物理块时归零（进度随 KV 作废，恢复时按 prefix 重算）。
+        self.prefill_offset = 0
         self.num_scheduled_tokens = 0
         self.is_prefill = True
         self.block_table = []
@@ -174,6 +184,37 @@ class Sequence:
     @property
     def last_block_num_tokens(self):
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
+
+    # ---------- Day8：prefill 进度语义（单一事实源 + 派生只读标志） ----------
+
+    @property
+    def prefill_target(self) -> int:
+        """prefill 阶段的目标终点 = 当前有效上下文长度 num_tokens。
+
+        对新请求即 prompt 长度；对抢占恢复请求，token_ids 已含已生成 token，
+        因此重算目标覆盖 prompt+已生成（§3.2）。调度接纳与输入组装只在
+        prefill 阶段读取该值；decode 阶段每追加一个 token 它随之增长，
+        因此 prefill_complete 的判定总是基于读取时刻的快照。
+        """
+        return self.num_tokens
+
+    @property
+    def prefill_complete(self) -> bool:
+        """派生只读标志（不可独立赋值）：有效 prefill 是否全部提交。
+
+        定义严格为 prefill_offset >= prefill_target。注意 decode 阶段每轮
+        追加新 token 使 num_tokens 增长，而 prefill_offset 只跟踪已提交 KV
+        的上下文（= num_tokens - 1），因此 decode 期间该标志为 False 是
+        定义使然；调度与 postprocess 只在 prefill 阶段消费它。
+        """
+        return self.prefill_offset >= self.prefill_target
+
+    @property
+    def num_cached_tokens(self) -> int:
+        """Day7 兼容只读视图：历史上该字段混用"prefix 命中量"与"已执行进度"
+        两个语义，Day8 起统一到 prefill_offset 单一事实源，这里仅返回其当前值，
+        不再提供独立可写状态（避免双事实源漂移）。"""
+        return self.prefill_offset
 
     def block(self, i):
         assert 0 <= i < self.num_blocks
@@ -261,7 +302,8 @@ class Sequence:
         payload = {
             "num_tokens": self.num_tokens,
             "num_prompt_tokens": self.num_prompt_tokens,
-            "num_cached_tokens": self.num_cached_tokens,
+            # v3 起进度字段名为 prefill_offset（语义与旧 num_cached_tokens 一致）
+            "prefill_offset": self.prefill_offset,
             "num_scheduled_tokens": self.num_scheduled_tokens,
             "block_table": self.block_table,
             "last_state": last_state,
@@ -272,17 +314,23 @@ class Sequence:
         return (Sequence.STATE_VERSION, payload)
 
     def __setstate__(self, state):
-        # v2 格式：(版本号, 字段名字典)。版本号显式参与校验：
-        # 未知版本立刻报清晰错误，而不是静默按当前结构误读字段
+        # (版本号, 字段名字典) 格式。版本号显式参与校验：
+        # 未知版本立刻报清晰错误，而不是静默按当前结构误读字段。
+        # 当前进程可读取 v2（num_cached_tokens 字段名）与 v3（prefill_offset）
         if isinstance(state, tuple) and len(state) == 2 and isinstance(state[1], dict):
             version, payload = state
-            if version != Sequence.STATE_VERSION:
+            if version not in (2, Sequence.STATE_VERSION):
                 raise ValueError(
                     f"不支持的 Sequence 状态格式版本: {version!r}（当前支持 {Sequence.STATE_VERSION}）"
                 )
             self.num_tokens = payload["num_tokens"]
             self.num_prompt_tokens = payload["num_prompt_tokens"]
-            self.num_cached_tokens = payload["num_cached_tokens"]
+            if "prefill_offset" in payload:
+                self.prefill_offset = payload["prefill_offset"]
+            else:
+                # v2 兼容：旧字段 num_cached_tokens 的语义就是 prefill_offset，
+                # 单向映射，数值口径不变
+                self.prefill_offset = payload["num_cached_tokens"]
             self.num_scheduled_tokens = payload["num_scheduled_tokens"]
             self.block_table = payload["block_table"]
             self.status = payload.get("status", SequenceStatus.WAITING)
@@ -291,10 +339,11 @@ class Sequence:
             last_state = payload["last_state"]
         else:
             # v1 兼容：旧 6 元组仅做单向读取（不承诺双向转发）。
-            # 控制面字段回退默认值；last_state 为列表即 prefill 模式、
+            # 控制面字段回退默认值；第 3 位 num_cached_tokens 映射为
+            # prefill_offset；last_state 为列表即 prefill 模式、
             # 为标量即 decode 模式，据此恢复 is_prefill，
             # 保证恢复后的对象可以再次 pickle 往返而不退化成空 prefill payload
-            (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
+            (self.num_tokens, self.num_prompt_tokens, self.prefill_offset,
              self.num_scheduled_tokens, self.block_table, last_state) = state
             self.is_prefill = isinstance(last_state, list)
             self.status = SequenceStatus.WAITING
