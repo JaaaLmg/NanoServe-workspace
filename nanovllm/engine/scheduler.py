@@ -39,6 +39,15 @@ class RoundDecision:
     blocking_reason: str | None = None
     # 决策时该请求累计预算等待秒数（已结算 + 当前未结算，§5.3）
     budget_wait_seconds: float = 0.0
+    # ---------- Day8 chunk 观测字段（仅 scheduled 决策填充，其余为 None） ----------
+    # 本轮接纳的是该请求当前 prefill 阶段的第几个 chunk（1-based，由 Scheduler
+    # 的 per-request 计数器维护；prefix 命中/抢占恢复开启新 prefill 阶段时
+    # 重新从 1 计数），供日志排查与 chunk 序列连续性验证
+    chunk_index: int | None = None
+    # 接纳时刻的进度起点（已提交 KV 的上下文 token 数）
+    offset_before: int | None = None
+    # 本轮是否为该请求当前 prefill 阶段的最后一个 chunk（接纳即完成 prefill）
+    is_last_chunk: bool | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -51,6 +60,9 @@ class RoundDecision:
             "blocked_by_seq_id": self.blocked_by_seq_id,
             "blocking_reason": self.blocking_reason,
             "budget_wait_seconds": self.budget_wait_seconds,
+            "chunk_index": self.chunk_index,
+            "offset_before": self.offset_before,
+            "is_last_chunk": self.is_last_chunk,
         }
 
 
@@ -88,6 +100,11 @@ class Scheduler:
         self.max_num_seqs = validate_positive_int(config.max_num_seqs, "max_num_seqs")
         self.max_num_batched_tokens = validate_positive_int(
             config.max_num_batched_tokens, "max_num_batched_tokens")
+        # Day8：单请求单轮 prefill query 上限。直接构造路径（SimpleNamespace）
+        # 缺省该字段时回退默认值 1024（与 Config 默认一致），测试显式提供。
+        # 与 B 相互独立：chunk_size 限制每请求，B 限制每轮总量，互不替代。
+        self.chunk_size = validate_positive_int(
+            getattr(config, "chunk_size", 1024), "chunk_size")
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
@@ -110,6 +127,10 @@ class Scheduler:
         self.last_schedule_stats: dict | None = None
         # 预算等待记录：seq_id -> BudgetWaitStats；只为有过 budget episode 的请求创建
         self.budget_wait: dict[int, BudgetWaitStats] = {}
+        # Day8：请求当前 prefill 阶段已接纳的 chunk 计数（rank 0 观测字段，不进
+        # TP payload）。首次接纳（无 block_table，即新阶段首个 chunk）重置为 1；
+        # 终态收尾时删除记录，避免全历史驻留
+        self._prefill_chunk_count: dict[int, int] = {}
         # Scheduler 生命周期标量累计（§5.3）：
         # budget_deferred_unique_requests_total：出现过 budget episode 的唯一请求数
         # budget_deferred_request_rounds_total：处于预算等待原因的请求-轮次总数
@@ -198,6 +219,8 @@ class Scheduler:
         if owned:
             del self.requests[seq.seq_id]
             self._active_request_ids.discard(seq.request_id)
+            # Day8 chunk 计数随请求终态回收（seq_id 全局唯一，记录不会误伤新请求）
+            self._prefill_chunk_count.pop(seq.seq_id, None)
             # 终态预算收尾：结算未关闭 episode、发终态等待摘要并删除记录
             self._settle_terminal_budget_stats(seq, now)
 
@@ -407,16 +430,17 @@ class Scheduler:
         返回 (分配时沿用的缓存块数, 本轮需求 needed_tokens)；
         needed_tokens=None 表示 KV 容量不足（can_allocate 返回 -1），
         此时调用方不得声称"本次被 budget 拒绝"。
-        - 未分配过 block 的请求：需求 = 总 token - prefix 命中 token
-          （缓存块本轮不再执行、不占 token 预算）；
-        - 已持有 block 的分块/恢复请求：需求 = 总 token - 已缓存执行进度。
+        - 未分配过 block 的请求：需求基于显式进度计算 = 总 token - prefix 命中
+          token（命中块本轮不再执行、不占 token 预算）；
+        - 已持有 block 的分块/恢复请求：需求 = 总 token - prefill_offset
+          （prefill_offset 是已提交 KV 进度的唯一事实源）。
         """
         if not seq.block_table:
             num_cached_blocks = self.block_manager.can_allocate(seq)
             if num_cached_blocks == -1:
                 return 0, None
             return num_cached_blocks, seq.num_tokens - num_cached_blocks * self.block_size
-        return 0, seq.num_tokens - seq.num_cached_tokens
+        return 0, seq.num_tokens - seq.prefill_offset
 
     def _attribute_prefill_stop(self, decisions: list[RoundDecision], decided: set[int], *,
                                 reason: str, needed: int | None, kv_checked: bool):
@@ -511,6 +535,15 @@ class Scheduler:
             if len(batch) > self.max_num_seqs:
                 raise ValueError(
                     f"round {round_id}: 批次序列数 {len(batch)} 超过上限 {self.max_num_seqs}")
+            # Day8：chunk_size 上限与预算/序列数独立校验（四条独立，互不替代）。
+            # 每请求每轮接纳的 prefill query 数不得超过 chunk_size（decode 恒为 1，
+            # 天然满足，无需区分阶段）
+            over_chunk = [seq.seq_id for seq in batch
+                          if seq.num_scheduled_tokens > self.chunk_size]
+            if over_chunk:
+                raise ValueError(
+                    f"round {round_id}: 序列 {over_chunk} 的单轮接纳数超过 "
+                    f"chunk_size={self.chunk_size}")
             seq_ids = [seq.seq_id for seq in batch]
             if len(set(seq_ids)) != len(seq_ids):
                 raise ValueError(f"round {round_id}: 批次内 seq_id 重复: {seq_ids}")
@@ -564,13 +597,17 @@ class Scheduler:
         decided: set[int] = set()
 
         # ---------- prefill：按 waiting 当前顺序（阶段内 FCFS）尝试接纳 ----------
-        while self.waiting and len(batch) < self.max_num_seqs:
-            seq = self.waiting[0]
+        # Day8：扫描位置与队列分离——中间 chunk 的请求保持 WAITING 原地
+        # （保留 block_table 与已提交进度），但本轮不再被扫描
+        # （每请求每轮至多一个 chunk）；扫描位置前进，后续请求仍按 FCFS 考察
+        scan = 0
+        while self.waiting and len(batch) < self.max_num_seqs and scan < len(self.waiting):
+            seq = self.waiting[scan]
             remaining = budget - used
             if remaining == 0:
                 # 预算恰好耗尽（未命中序列数上限）：首个未处理请求记 budget，
                 # 无需查询 KV，不虚构其需求与 KV 可行性；尾部记预算 HOL。
-                # 若队首是本轮刚分块的请求（已有 scheduled 决策），归因自动跳过它
+                # 若首个未处理请求是本轮刚分块的请求（已有 scheduled 决策），归因自动跳过它
                 self._attribute_prefill_stop(decisions, decided, reason=REASON_BUDGET,
                                              needed=None, kv_checked=False)
                 break
@@ -580,30 +617,51 @@ class Scheduler:
                 self._attribute_prefill_stop(decisions, decided, reason=REASON_KV_CAPACITY,
                                              needed=None, kv_checked=True)
                 break
-            if remaining < needed and batch:
-                # 非首候选放不下：整请求延后（记录已算出的需求），停止扫描，
-                # 不绕过它去接纳更短尾部（队内 FCFS）
+            # Day8：计划 chunk q = min(剩余需求, chunk_size, 剩余预算)。
+            # chunk_size 与 B 是两条独立上限：首候选允许 q < 需求（拆分）；
+            # 后续候选必须整段放下（q == needed），否则停止扫描（FCFS 不跳过，
+            # 不绕过它去接纳更短尾部）。chunk_size 造成的部分推进不产生新的
+            # 等待原因——被拆分候选本身记 scheduled，放不下的后续候选沿用
+            # Day7 的 budget 归因口径
+            q = min(needed, self.chunk_size, remaining)
+            if q < needed and batch:
+                # 非首候选放不下：整请求延后（记录已算出的需求），停止扫描
                 self._attribute_prefill_stop(decisions, decided, reason=REASON_BUDGET,
                                              needed=needed, kv_checked=not seq.block_table)
                 break
             # 接纳：此刻才分配 block、设置正 token 数并扣减预算
-            # kv_checked 在分配前捕获（allocate 会填充 block_table）
+            # kv_checked 在分配前捕获（allocate 会填充 block_table 并设置初始 offset）
             kv_checked = not seq.block_table
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
-            seq.num_scheduled_tokens = min(needed, remaining)
-            used += seq.num_scheduled_tokens
+                # 无 block_table 即新 prefill 阶段（新请求 / 抢占恢复重算）的首个
+                # chunk：计数从 1 重新开始；续传 chunk 在旧计数上递增
+                chunk_index = 1
+            else:
+                chunk_index = self._prefill_chunk_count.get(seq.seq_id, 0) + 1
+            self._prefill_chunk_count[seq.seq_id] = chunk_index
+            offset_before = seq.prefill_offset
+            seq.num_scheduled_tokens = q
+            used += q
             decided.add(seq.seq_id)
             decisions.append(RoundDecision(
                 seq.seq_id, seq.request_id, REASON_SCHEDULED,
-                needed_tokens=needed, scheduled_tokens=seq.num_scheduled_tokens,
-                kv_checked=kv_checked))
-            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
-                # prefill 完成才算被调度接纳：WAITING -> RUNNING 走统一迁移入口；
-                # 中间 chunk 仍保持 WAITING（下一轮延续进度）
+                needed_tokens=needed, scheduled_tokens=q,
+                kv_checked=kv_checked,
+                chunk_index=chunk_index,
+                offset_before=offset_before,
+                is_last_chunk=offset_before + q == seq.prefill_target))
+            if offset_before + q == seq.prefill_target:
+                # prefill 完成才算被调度接纳：WAITING -> RUNNING 走统一迁移入口
+                # （迁移条件与 Day7 一致：offset + q == prefill_target，
+                # 即最后一个 chunk 被接纳）；中间 chunk 仍保持 WAITING
                 seq.transition_to(SequenceStatus.RUNNING)
-                self.waiting.popleft()
+                # 扫描位置可能已越过队首（前面驻留中间 chunk 请求），按对象移除
+                self.waiting.remove(seq)
                 self._enqueue_running(seq)
+            else:
+                # 中间 chunk：本轮不再扫描该请求，扫描位置前进越过它
+                scan += 1
             batch.append(seq)
 
         if self.waiting and len(batch) >= self.max_num_seqs:
@@ -684,11 +742,51 @@ class Scheduler:
         phase = "decode" if batch else "idle"
         return self._finalize_round(batch, False, phase, decisions, now)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool,
-                    now: float | None = None):
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int] | None,
+                    is_prefill: bool, now: float | None = None):
+        """模型执行返回后的收尾：安全检查 -> 原子提交 chunk 进度 -> 完成判定。
+
+        Day8 提交契约（§4.5）：
+        - token 数显式校验：prefill 轮只有"最后 chunk"（offset + q == target）
+          的请求产出采样 token，中间 chunk 不采样；decode 轮每序列 1 token。
+          run() 对"本轮无任何采样"返回 None，这里与空列表同价。数量不匹配
+          显式抛错，不使用会静默截断的 zip。
+        - 批次快照一致（先整批校验再逐个提交，避免半提交状态）：活动请求必须
+          带有本轮调度设置的待执行计划（num_scheduled_tokens > 0）；计数已
+          清零说明本批次是重复/迟到的旧 postprocess，拒绝推进进度。
+        - 原子性：每个 chunk 只被成功执行它的这一轮提交一次；取消/超时/
+          终态不推进 offset；提交后立即校验单调有界（offset <= target）。
+        """
         if now is None:
             now = perf_counter()
-        for seq, token_id in zip(seqs, token_ids):
+        samples = list(token_ids) if token_ids is not None else []
+        # 需采样请求集合：必须在任何状态变更前按调度快照计算——
+        # prefill 轮 = offset + q == prefill_target（最后 chunk）；
+        # decode 轮 = 全部。安全检查丢弃的采样在 token_ids 中仍占位，
+        # 游标推进与安全检查解耦，保证对齐关系不因丢弃而错位
+        needs_sample = [
+            (not is_prefill)
+            or (seq.prefill_offset + seq.num_scheduled_tokens == seq.prefill_target)
+            for seq in seqs
+        ]
+        # 全终态批次（纯迟到重放）不校验 token 数：其请求已被安全路径幂等清理，
+        # 携带的 token 无意义；Day6/Day7 所有权测试依赖"全终态旧批次重放是
+        # 安全空操作"。含活动请求的批次必须与调度计划严格一致
+        has_live = any(not seq.is_terminal for seq in seqs)
+        if has_live and len(samples) != sum(needs_sample):
+            raise ValueError(
+                f"postprocess 采样 token 数与需采样请求数不一致：得到 {len(samples)}，"
+                f"期望 {sum(needs_sample)}（is_prefill={is_prefill}，批次 {len(seqs)}）")
+        for seq in seqs:
+            if not seq.is_terminal and seq.num_scheduled_tokens <= 0:
+                raise ValueError(
+                    f"request {seq.request_id!r} (seq_id={seq.seq_id}) "
+                    f"无待执行的调度计划，疑似重复或迟到的 postprocess，已拒绝提交")
+        ti = 0  # token_ids 游标
+        for seq, need in zip(seqs, needs_sample):
+            token_id = samples[ti] if need else None
+            if need:
+                ti += 1
             # 安全边界（模型执行返回后、追加 token 与 KV 记账之前）：
             # 1) 终态兜底：外部 mark_* 产生的终态请求直接清理，不参与记账；
             # 2) 取消标记优先于超时（客户端显式意图优先于系统判断）；
@@ -698,6 +796,7 @@ class Scheduler:
             # 从活动索引移除后超时就再也无法纠正。
             # 注意：即使输出被丢弃，本轮已执行的实际输入仍按计划快照计入预算，
             # 预算等待统计的终态结算使用本入口的 now（内部嵌套清理不重复取时）。
+            # 安全检查命中的请求不推进 offset（失败不提交，§4.5）
             if seq.is_terminal:
                 self._finalize(seq, now)
                 continue
@@ -709,14 +808,27 @@ class Scheduler:
                 seq.mark_timeout("deadline_exceeded", now=now)
                 self._finalize(seq, now)
                 continue
-            self.block_manager.hash_blocks(seq)
-            seq.num_cached_tokens += seq.num_scheduled_tokens
+            # ---------- Day8 原子提交（成功路径） ----------
+            offset_before = seq.prefill_offset
+            q = seq.num_scheduled_tokens
+            # hash_blocks 接收显式区间 [offset_before, offset_before + q)：
+            # 只登记本次执行写满的完整块（中间 chunk 写满的块同样登记，
+            # 尾块永不登记）
+            self.block_manager.hash_blocks(seq, offset_before, offset_before + q)
+            seq.prefill_offset = offset_before + q
             seq.num_scheduled_tokens = 0
-            if is_prefill and seq.num_cached_tokens < seq.num_tokens:
+            # 单调有界校验（§5.3 不变量 1）：推进后立即核对，违反即显式抛错
+            if seq.prefill_offset > seq.prefill_target:
+                raise ValueError(
+                    f"request {seq.request_id!r}: 提交后 prefill_offset "
+                    f"{seq.prefill_offset} 超过目标 {seq.prefill_target}，进度记账被破坏")
+            if is_prefill and seq.prefill_offset < seq.prefill_target:
+                # 中间 chunk：丢弃采样结果，保持 WAITING，下一轮延续进度
                 continue
-            seq.append_token(token_id)
+            # 最后 chunk（或 decode 轮）：追加采样的首 completion；
             # 完成判定：EOS 触发记为 stop，达到 max_tokens 记为 length；
             # mark_finished 幂等，配合 _finalize 保证不 double free
+            seq.append_token(token_id)
             if not seq.ignore_eos and token_id == self.eos:
                 seq.mark_finished("stop")
                 self._finalize(seq, now)

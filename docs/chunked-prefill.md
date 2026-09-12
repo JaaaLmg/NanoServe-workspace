@@ -1,6 +1,6 @@
 # Day 8 Chunked Prefill 设计
 
-> 本文对应 `plan.md` 阶段二 Day 8，目标是把长 prompt 的 prefill 拆成显式、可验证的多个 iteration，逐块写入 KV Cache，并保证跨 chunk 的 token 顺序、位置编码和 attention 语义与一次性 prefill 完全一致。本文是**待实现的设计与验收标准**，不是实现完成报告；文中“当前实现”指编写文档时 `feature/chunked-prefill` 分支（基线为 dev=`5d56710`，含 Day7）的实际代码。
+> 本文对应 `plan.md` 阶段二 Day 8，目标是把长 prompt 的 prefill 拆成显式、可验证的多个 iteration，逐块写入 KV Cache，并保证跨 chunk 的 token 顺序、位置编码和 attention 语义与一次性 prefill 完全一致。本文是设计与验收标准；Day 8 已在 `feature/chunked-prefill` 分支完成实现与验收，完成情况与逐项核对见 [day8-validation.md](./day8-validation.md)，独立审查结论见 [day8-review.md](./day8-review.md)。文中“当前实现”指编写文档时 `feature/chunked-prefill` 分支（基线为 dev=`5d56710`，含 Day7）的实际代码。
 
 - 适用范围：`Sequence` 的 prefill 进度语义、`Scheduler` 的 prefill 分块接纳、`BlockManager` 的进度提交、`ModelRunner`/`Context`/`Attention` 的输入构造与执行契约、采样行为、以及 CPU/GPU 测试与性能对比。
 - 不在本日范围：混合 Prefill/Decode batch（Day9）、完整取消/超时/抢占与恢复策略（Day10）、HTTP/SSE 与流式输出（Day11–13）、Prefix Cache 淘汰策略（LRU/LFU）、自适应 chunk size、请求优先级、量化/投机解码/PD 分离。
@@ -413,29 +413,29 @@ Day7 的“预算即分块”既有断言（如 20-token → 8/8/4）在默认 c
 
 ### 功能与口径
 
-- [ ] `Config.chunk_size` 显式正整数校验，默认 1024，运行中不可变，`python -O` 仍生效。
-- [ ] `prefill_offset` 为唯一进度事实源，`num_cached_tokens` 兼容只读，`prefill_complete` 派生；终态/释放后进度作废不污染复用 ID。
-- [ ] 长 prompt 分块推进：区间连续单调无重叠遗漏，每请求每轮至多一个 chunk，首候选拆分、FCFS 不跳过。
-- [ ] 每轮 `q_i <= chunk_size` 且 `sum(q_i) <= B`、`len(batch) <= max_num_seqs` 独立校验；chunk 部分推进不误记为 budget 等待。
-- [ ] prefix 命中/抢占恢复按显式 offset 正确重算；尾块永不命中；`hash_blocks` 显式区间只登记写满块。
-- [ ] 中间 chunk 不采样、不消耗 RNG、不追加 completion；最后 chunk 采样该请求最后 query 行并完成 prefill。
+- [x] `Config.chunk_size` 显式正整数校验，默认 1024，运行中不可变，`python -O` 仍生效。
+- [x] `prefill_offset` 为唯一进度事实源，`num_cached_tokens` 兼容只读，`prefill_complete` 派生；终态/释放后进度作废不污染复用 ID。
+- [x] 长 prompt 分块推进：区间连续单调无重叠遗漏，每请求每轮至多一个 chunk，首候选拆分、FCFS 不跳过。
+- [x] 每轮 `q_i <= chunk_size` 且 `sum(q_i) <= B`、`len(batch) <= max_num_seqs` 独立校验；chunk 部分推进不误记为 budget 等待。
+- [x] prefix 命中/抢占恢复按显式 offset 正确重算；尾块永不命中；`hash_blocks` 显式区间只登记写满块。
+- [x] 中间 chunk 不采样、不消耗 RNG、不追加 completion；最后 chunk 采样该请求最后 query 行并完成 prefill。
 
 ### 执行正确性
 
-- [ ] `prepare_prefill` 消费显式 offset 并通过范围/长度校验；input_ids/positions/slot_mapping/cu_seqlens 一一对应；positions 为绝对位置。
-- [ ] attention key 长度 = 历史有效 KV + 当前 query；causal 不变；多请求混合批次无串扰。
-- [ ] decode 位置/上下文长度使用序列元数据（TP worker 空 token_ids 不影响）。
-- [ ] postprocess 原子提交：成功才推进 offset；取消/超时/异常/重复收尾不推进；批次快照校验拒绝迟到结果。
-- [ ] `Sequence` pickle v3 + v1/v2 单向兼容，往返测试通过；rank 0 统计不进 TP payload。
+- [x] `prepare_prefill` 消费显式 offset 并通过范围/长度校验；input_ids/positions/slot_mapping/cu_seqlens 一一对应；positions 为绝对位置。
+- [x] attention key 长度 = 历史有效 KV + 当前 query；causal 不变；多请求混合批次无串扰。
+- [x] decode 位置/上下文长度使用序列元数据（TP worker 空 token_ids 不影响）。
+- [x] postprocess 原子提交：成功才推进 offset；取消/超时/异常/重复收尾不推进；批次快照校验拒绝迟到结果。
+- [x] `Sequence` pickle v3 + v1/v2 单向兼容，往返测试通过；rank 0 统计不进 TP payload。
 
 ### 实测与交付
 
-- [ ] 8K prompt 在 256/512/1024 三档下分块完成且不 OOM（KV 容量自检先行）。
-- [ ] 至少 5 个固定 prompt 的 chunked vs one-shot greedy 输出一致（差异须分析记录）。
-- [ ] 256/512/1024 执行时间与显存峰值原始数据归档，配置/命令/seed 可复现。
-- [ ] CPU 全量回归（新测试 + Day2–7）与 `python -O` 通过，数字为实际执行结果。
-- [ ] `docs/day8-validation.md` 记录 GPU/模型可用性、实际命令、结果与未覆盖边界；设计文档加入 `docs/README.md` 索引；日志证据无 prompt/token 明文。
-- [ ] TP>1 / CUDA Graph / 真实并发取消：实测或如实记录未测。
+- [x] 8K prompt 在 256/512/1024 三档下分块完成且不 OOM（KV 容量自检先行）。
+- [x] 至少 5 个固定 prompt 的 chunked vs one-shot greedy 输出一致（差异须分析记录）。
+- [x] 256/512/1024 执行时间与显存峰值原始数据归档，配置/命令/seed 可复现。
+- [x] CPU 全量回归（新测试 + Day2–7）与 `python -O` 通过，数字为实际执行结果。
+- [x] `docs/day8-validation.md` 记录 GPU/模型可用性、实际命令、结果与未覆盖边界；设计文档加入 `docs/README.md` 索引；日志证据无 prompt/token 明文。
+- [ ] TP>1 / CUDA Graph / 真实并发取消：实测或如实记录未测。（本环境未实测，已按"如实记录未测"分支处理，见 `day8-validation.md` §8/§9；勾选条件为完成实测。）
 
 ## 11. 与 Day9–10 的衔接
 

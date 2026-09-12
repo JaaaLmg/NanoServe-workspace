@@ -17,6 +17,12 @@
 - 日志：JSON 事件可解析、round_id 唯一、执行 <=B、计数可重算、无 prompt 明文；
 - 长序列混合：固定 seed 交错操作 + 轮次上限 + 资源/身份平衡。
 
+Day8 适配说明（docs/chunked-prefill.md）：决策快照新增 chunk_index/offset_before/
+is_last_chunk 三个字段（精确字典断言同步扩展）；postprocess 提交契约收紧为
+"中间 chunk 不采样"——分块 prefill 的中间轮 postprocess 不再传入 token，
+混合随机场景的 token 注入改为按需采样集合注入。除注入方式外，预算行为断言
+（如 20-token/B=8 的 8/8/4）在默认 chunk_size=1024 下原样保持。
+
 无 GPU / 模型依赖：Scheduler 只读取 Config 的少数字段（SimpleNamespace 构造），
 LLMEngine 通过 __new__ 跳过需要 GPU 的 __init__；时间使用注入的确定值（now 关键字），
 不加载权重、不 sleep。
@@ -277,10 +283,12 @@ class TestSinglePrefill:
         assert seq.num_scheduled_tokens == 3
         assert sched.last_schedule_stats["planned_tokens"] == 3
         d = decision_of(sched.last_schedule_stats, seq)
+        # Day8 新增 chunk 观测字段：单 chunk 决策即最后 chunk（chunk_index 1-based）
         assert d == {"seq_id": seq.seq_id, "request_id": seq.request_id,
                      "needed_tokens": 3, "scheduled_tokens": 3, "reason": "scheduled",
                      "kv_checked": True, "blocked_by_seq_id": None,
-                     "blocking_reason": None, "budget_wait_seconds": 0.0}
+                     "blocking_reason": None, "budget_wait_seconds": 0.0,
+                     "chunk_index": 1, "offset_before": 0, "is_last_chunk": True}
         sched.postprocess(batch, [7], True, now=1.0)
         assert seq.status == RUNNING
 
@@ -306,12 +314,13 @@ class TestSinglePrefill:
             assert is_prefill and len(batch) == 1
             d = decision_of(sched.last_schedule_stats, seq)
             chunks.append((d["needed_tokens"], seq.num_scheduled_tokens))
-            # 中间片段的采样输出应被丢弃：不追加 token
-            sched.postprocess(batch, [7], is_prefill, now=t)
+            # Day8 提交契约：中间 chunk 不采样（不传 token），最后 chunk 才传入
+            last = seq.prefill_offset + seq.num_scheduled_tokens == seq.prefill_target
+            sched.postprocess(batch, [7] if last else [], is_prefill, now=t)
             token_lens.append(len(seq.token_ids))
         # 需求按未缓存进度递减：20 -> 12 -> 4；接纳数每轮 8、8、4
         assert chunks == [(20, 8), (12, 8), (4, 4)]
-        # 中间片段不追加采样结果（20、20），最后片段才 append completion（21）
+        # 中间 chunk 不追加采样结果（20、20），最后 chunk 才 append completion（21）
         assert token_lens == [20, 20, 21]
         assert seq.status == RUNNING
         assert seq.num_cached_tokens == 20
@@ -325,7 +334,8 @@ class TestSinglePrefill:
         for t in (1.0, 2.0, 3.0):
             batch, is_prefill = sched.schedule(now=t)
             block_counts.append(len(seq.block_table))
-            sched.postprocess(batch, [7], is_prefill, now=t)
+            last = seq.prefill_offset + seq.num_scheduled_tokens == seq.prefill_target
+            sched.postprocess(batch, [7] if last else [], is_prefill, now=t)
         assert block_counts == [3, 3, 3]  # 首轮一次性分配全部 3 块
         bm = sched.block_manager
         assert len(bm.used_block_ids) == 3
@@ -730,7 +740,8 @@ class TestBudgetWaitCounts:
             assert is_prefill
             assert sched.last_schedule_stats["budget_deferred_requests"] == 0
             assert decision_of(sched.last_schedule_stats, seq)["reason"] == "scheduled"
-            sched.postprocess(batch, [7], is_prefill, now=t)
+            last = seq.prefill_offset + seq.num_scheduled_tokens == seq.prefill_target
+            sched.postprocess(batch, [7] if last else [], is_prefill, now=t)
         assert seq.seq_id not in sched.budget_wait
 
     def test_non_budget_reasons_not_mixed_into_counts(self):
@@ -1236,7 +1247,10 @@ class TestMixedRandomScenario:
             # 驱动一轮
             batch, is_prefill = sched.schedule(now=now)
             assert_round_invariants(sched, batch)
-            token_ids = [rng.randint(1, 100) for _ in batch]
+            # Day8 提交契约：prefill 轮只有最后 chunk 的请求产出采样 token
+            token_ids = [rng.randint(1, 100) for s in batch
+                         if not is_prefill or (s.prefill_offset + s.num_scheduled_tokens
+                                               == s.prefill_target)]
             sched.postprocess(batch, token_ids, is_prefill, now=now)
             if batch:
                 stale_batches.append((list(batch), is_prefill, token_ids))
@@ -1283,8 +1297,11 @@ class TestMixedRandomScenario:
             planned = sched.last_schedule_stats["planned_tokens"]
             assert 0 <= planned <= 8
             assert len(batch) <= 4
-            sched.postprocess(batch, [rng.randint(1, 100) for _ in batch],
-                              is_prefill, now=now)
+            # Day8 提交契约：prefill 轮只有最后 chunk 的请求产出采样 token
+            tokens = [rng.randint(1, 100) for s in batch
+                      if not is_prefill or (s.prefill_offset + s.num_scheduled_tokens
+                                            == s.prefill_target)]
+            sched.postprocess(batch, tokens, is_prefill, now=now)
         for sid in list(sched.requests):
             sched.cancel(sid, now=now)
         assert sched.is_finished()

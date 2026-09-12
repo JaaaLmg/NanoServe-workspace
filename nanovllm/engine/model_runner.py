@@ -128,39 +128,10 @@ class ModelRunner:
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
-        input_ids = []
-        positions = []
-        cu_seqlens_q = [0]
-        cu_seqlens_k = [0]
-        max_seqlen_q = 0
-        max_seqlen_k = 0
-        slot_mapping = []
+        (input_ids, positions, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+         slot_mapping, has_block_table) = self._build_prefill_inputs(seqs, self.block_size)
         block_tables = None
-        for seq in seqs:
-            start = seq.num_cached_tokens
-            seqlen_q = seq.num_scheduled_tokens
-            end = start + seqlen_q
-            seqlen_k = end
-            input_ids.extend(seq[start:end])
-            positions.extend(range(start, end))
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
-            max_seqlen_q = max(seqlen_q, max_seqlen_q)
-            max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:    # warmup
-                continue
-            start_block = start // self.block_size
-            end_block = (end + self.block_size - 1) // self.block_size
-            for i in range(start_block, end_block):
-                slot_start = seq.block_table[i] * self.block_size
-                if i == start_block:
-                    slot_start += start % self.block_size
-                if i != end_block - 1:
-                    slot_end = seq.block_table[i] * self.block_size + self.block_size
-                else:
-                    slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
-                slot_mapping.extend(range(slot_start, slot_end))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache：历史 KV 直接读缓存
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -170,16 +141,78 @@ class ModelRunner:
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
-    def prepare_decode(self, seqs: list[Sequence]):
+    @staticmethod
+    def _build_prefill_inputs(seqs: list[Sequence], block_size: int):
+        """CPU 纯组装逻辑（无 CUDA 依赖，可被单元测试直接调用）。
+
+        Day8 显式 offset 契约：对每个 seq 消费
+          start = seq.prefill_offset        # 已提交 KV 的上下文长度（唯一进度事实源）
+          q     = seq.num_scheduled_tokens  # 本轮接纳的 chunk 大小
+          end   = start + q
+        并显式校验 0 <= start < end <= prefill_target（否则抛错，不静默组装）。
+        - input_ids  取 seq[start:end]，跨 chunk 时是正确的后续片段；
+        - positions  使用绝对位置 range(start, end)，绝不从 0 重置；
+        - cu_seqlens_k 每段为 end = 历史有效 KV + 当前 query，causal 语义由
+          flash_attn_varlen_func 的 varlen 约定保证；
+        - slot_mapping 覆盖 [start, end) 的物理槽位，按 block_table 跨块切分。
+        返回 (input_ids, positions, cu_seqlens_q, cu_seqlens_k, max_q, max_k,
+              slot_mapping, has_block_table)。
+        """
         input_ids = []
         positions = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = 0
+        max_seqlen_k = 0
         slot_mapping = []
-        context_lens = []
+        has_block_table = True
         for seq in seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            start = seq.prefill_offset
+            seqlen_q = seq.num_scheduled_tokens
+            end = start + seqlen_q
+            # 显式范围校验：区间必须落在有效上下文内且非空，否则拒绝组装
+            if not (0 <= start < end <= seq.prefill_target):
+                raise ValueError(
+                    f"seq_id={seq.seq_id}: 非法 prefill 区间 [{start}, {end})，"
+                    f"prefill_target={seq.prefill_target}，"
+                    f"num_scheduled_tokens={seqlen_q}")
+            input_ids.extend(seq[start:end])
+            positions.extend(range(start, end))
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + end)
+            max_seqlen_q = max(seqlen_q, max_seqlen_q)
+            max_seqlen_k = max(end, max_seqlen_k)
+            if not seq.block_table:    # warmup：无物理块，不组装 slot
+                has_block_table = False
+                continue
+            start_block = start // block_size
+            end_block = (end + block_size - 1) // block_size
+            for i in range(start_block, end_block):
+                slot_start = seq.block_table[i] * block_size
+                if i == start_block:
+                    slot_start += start % block_size
+                if i != end_block - 1:
+                    slot_end = seq.block_table[i] * block_size + block_size
+                else:
+                    slot_end = seq.block_table[i] * block_size + end - i * block_size
+                slot_mapping.extend(range(slot_start, slot_end))
+        # 展平长度校验（显式 raise，python -O 下仍生效，§4.3）：
+        # input_ids / positions / cu_seqlens_q[-1] 必须一致；
+        # slot_mapping 仅对真实批次（全部持有 block_table）要求一一对应，
+        # warmup 批次不组装 slot，豁免该校验
+        total_q = cu_seqlens_q[-1]
+        if len(input_ids) != total_q or len(positions) != total_q:
+            raise ValueError(
+                f"prefill 输入长度不一致：input_ids={len(input_ids)}, "
+                f"positions={len(positions)}, cu_seqlens_q[-1]={total_q}")
+        if has_block_table and len(slot_mapping) != total_q:
+            raise ValueError(
+                f"slot_mapping 长度 {len(slot_mapping)} 与 query 数 {total_q} 不一致")
+        return (input_ids, positions, cu_seqlens_q, cu_seqlens_k,
+                max_seqlen_q, max_seqlen_k, slot_mapping, has_block_table)
+
+    def prepare_decode(self, seqs: list[Sequence]):
+        input_ids, positions, slot_mapping, context_lens = self._build_decode_inputs(seqs, self.block_size)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -187,6 +220,26 @@ class ModelRunner:
         block_tables = self.prepare_block_tables(seqs)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
+
+    @staticmethod
+    def _build_decode_inputs(seqs: list[Sequence], block_size: int):
+        """CPU 纯组装逻辑（无 CUDA 依赖，可被单元测试直接调用）。
+
+        Day8 元数据修正：positions/context_lens 一律使用序列元数据
+        num_tokens，而不是可能依赖 token_ids 长度的口径——TP worker
+        反序列化后的 decode 序列 token_ids 为空（仅保留 last_token），
+        任何基于 token_ids 的推导都存在潜在错误。
+        """
+        input_ids = []
+        positions = []
+        slot_mapping = []
+        context_lens = []
+        for seq in seqs:
+            input_ids.append(seq.last_token)
+            positions.append(seq.num_tokens - 1)
+            context_lens.append(seq.num_tokens)
+            slot_mapping.append(seq.block_table[-1] * block_size + seq.last_block_num_tokens - 1)
+        return input_ids, positions, slot_mapping, context_lens
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
@@ -222,13 +275,60 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(self, seqs: list[Sequence], is_prefill: bool):
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures, top_ps, generators = self.prepare_sample(seqs) if self.rank == 0 else (None, None, None)
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures, top_ps, generators).tolist() if self.rank == 0 else None
+        if self.rank != 0:
+            reset_context()
+            return None
+        if not is_prefill:
+            temperatures, top_ps, generators = self.prepare_sample(seqs)
+            token_ids = self.sampler(logits, temperatures, top_ps, generators).tolist()
+            reset_context()
+            return token_ids
+        # ---------- Day8 prefill 采样契约 ----------
+        # 1) 行选择：ParallelLMHead 在 prefill 分支已按 cu_seqlens_q[1:]-1 把
+        #    每个请求的"最后一个 query 行"聚合为 [len(seqs), vocab]——批内第 i
+        #    行就是第 i 个请求的末 query logits（旧实现把整批 [T, hidden] 直接
+        #    交给 lm_head 后与 len(seqs) 的采样参数 zip，行语义成立但没有任何
+        #    显式校验，形状错位会静默发生）。这里显式断言行数与请求一一对应。
+        # 2) 中间 chunk 不采样、不消耗 RNG：torch.multinomial 会推进 generator
+        #    状态，若中间 chunk 也采样，chunk 划分不同就会改变 RNG 流，
+        #    "chunked 与 one-shot 输出一致"在随机采样下不可达。因此只有
+        #    offset + q == prefill_target 的最后 chunk 才进入采样。
+        if logits.shape[0] != len(seqs):
+            raise ValueError(
+                f"prefill logits 行数 {logits.shape[0]} 与请求数 {len(seqs)} 不一致，"
+                "每请求应恰好聚合出其最后 query 行")
+        sample_idx = self._select_prefill_sample_rows(seqs)
+        if not sample_idx:
+            # 本轮全部为中间 chunk：模型输出（logits）直接丢弃，无采样 token
+            reset_context()
+            return None
+        temperatures, top_ps, generators = self.prepare_sample(seqs)
+        token_ids = self.sampler(
+            logits[sample_idx],
+            temperatures[sample_idx],
+            top_ps[sample_idx],
+            [generators[i] for i in sample_idx],
+        ).tolist()
         reset_context()
         return token_ids
+
+    @staticmethod
+    def _select_prefill_sample_rows(seqs: list[Sequence]):
+        """CPU 纯逻辑（可被单元测试直接调用）：选出本轮需采样的请求下标。
+
+        只有最后 chunk（prefill_offset + num_scheduled_tokens == prefill_target）
+        的请求才采样。返回的批内下标同时是聚合后 logits [len(seqs), vocab]
+        的行号：ParallelLMHead 已按 cu_seqlens_q[1:]-1 把每个请求的最后
+        query 行放到第 i 行，无需再按扁平 token 位偏移选行。
+        """
+        sample_idx = []
+        for i, seq in enumerate(seqs):
+            if seq.prefill_offset + seq.num_scheduled_tokens == seq.prefill_target:
+                sample_idx.append(i)
+        return sample_idx
 
     @torch.inference_mode()
     def capture_cudagraph(self):

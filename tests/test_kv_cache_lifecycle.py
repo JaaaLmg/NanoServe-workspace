@@ -10,6 +10,8 @@ Config 的少数字段，用 SimpleNamespace 即可构造，避免依赖模型�
 
 from types import SimpleNamespace
 
+import pytest
+
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.sampling_params import SamplingParams
@@ -79,7 +81,11 @@ class TestFullLifecycle:
         assert len(bm.hash_to_block_id) == 1  # 哈希保留，供后续前缀复用
 
     def test_chunked_prefill_allocates_once_and_progresses(self):
-        """长 prompt 分块 prefill：块一次分配，进度由 num_cached_tokens 推进。"""
+        """长 prompt 分块 prefill：块一次分配，进度由 prefill_offset 推进。
+
+        Day8 提交契约：中间 chunk 不采样（postprocess 不接收 token，
+        传入会被显式拒绝），只有最后 chunk 产出首 completion。
+        """
         sched = make_scheduler(num_blocks=8, max_num_batched_tokens=5)
         seq = make_seq(12, max_tokens=2)
         sched.add(seq)
@@ -92,15 +98,17 @@ class TestFullLifecycle:
         assert seq.status == SequenceStatus.WAITING  # prefill 未完成，仍在 waiting
         assert list(sched.waiting) == [seq] and not sched.running
 
-        sched.postprocess(seqs, [6000], True)
+        # 中间 chunk：不采样。传入 token 违反提交契约，显式抛错
+        with pytest.raises(ValueError, match="需采样请求数"):
+            sched.postprocess(seqs, [6000], True)
+        sched.postprocess(seqs, [], True)
         assert seq.num_cached_tokens == 5
-        assert seq.num_completion_tokens == 0  # 中间 chunk 的采样 token 被丢弃
-        assert 6000 not in seq.token_ids
+        assert seq.num_completion_tokens == 0  # 中间 chunk 不产生任何 token
 
         # 第 2 chunk：5 token
         seqs, is_prefill = sched.schedule()
         assert is_prefill is True and seq.num_scheduled_tokens == 5
-        sched.postprocess(seqs, [6001], True)
+        sched.postprocess(seqs, [], True)
         assert seq.num_cached_tokens == 10
 
         # 第 3 chunk：最后 2 token，prefill 完成

@@ -89,7 +89,9 @@ class BlockManager:
             seq.block_table.append(block_id)
         for i in range(num_cached_blocks, seq.num_blocks):
             seq.block_table.append(self._allocate_block())
-        seq.num_cached_tokens = num_cached_blocks * self.block_size
+        # Day8：prefix 命中量直接计入 prefill_offset（唯一进度事实源）——
+        # 命中的完整块视为已提交上下文，首轮 chunk 从该偏移开始执行
+        seq.prefill_offset = num_cached_blocks * self.block_size
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -97,7 +99,9 @@ class BlockManager:
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
-        seq.num_cached_tokens = 0
+        # 进度随物理块作废：释放后 offset 归零，防止复用同一 ID 的新请求
+        # 继承旧请求的执行进度（恢复时重新按 prefix 查询重算）
+        seq.prefill_offset = 0
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
@@ -107,12 +111,25 @@ class BlockManager:
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())
 
-    def hash_blocks(self, seq: Sequence):
-        start = seq.num_cached_tokens // self.block_size
-        end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
-        if start == end: return
-        h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
-        for i in range(start, end):
+    def hash_blocks(self, seq: Sequence, start: int, end: int):
+        """把本次执行写满的完整块登记进 prefix 索引（Day8 显式区间契约）。
+
+        start/end 是本次成功执行的 query 区间 [start, end)（token 下标），
+        由调用方（Scheduler.postprocess）以 offset_before/offset_before+q
+        显式给出，不再从 num_cached_tokens/num_scheduled_tokens 内部推导。
+        只有被本次执行写满的块（块尾 <= end）才登记；尾块永不登记，
+        沿用 can_allocate 的 range(num_blocks - 1) 协议，避免尾块假命中。
+        中间 chunk 写满的块同样登记——这是 chunked prefill 仍能享受
+        prefix 复用的前提。start==end（空区间）是安全空操作。
+        """
+        start_block = start // self.block_size
+        # floor 除：未写满的尾块所在块不进入登记范围
+        end_block = end // self.block_size
+        if start_block == end_block: return
+        # 链式哈希从前一个已登记块延续；start_block>0 时该块必然已写满且
+        # 已登记（chunk 区间连续），或来自 prefix 命中（命中块自带哈希）
+        h = self.blocks[seq.block_table[start_block - 1]].hash if start_block > 0 else -1
+        for i in range(start_block, end_block):
             block = self.blocks[seq.block_table[i]]
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)

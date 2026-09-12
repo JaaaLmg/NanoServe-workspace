@@ -724,7 +724,9 @@ class TestPostprocessDeadline:
         batch, is_prefill = sched.schedule()          # 第 1 个 chunk，仍为 WAITING
         assert is_prefill is True and seq.status == WAITING
 
-        sched.postprocess(batch, [9], is_prefill, now=seq.deadline + 1)
+        # Day8 提交契约：中间 chunk 执行不产生采样 token（真实 runner 返回 None）；
+        # 即使 deadline 已过，安全路径同样丢弃输出、不推进 offset，按 TIMEOUT 终止
+        sched.postprocess(batch, [], is_prefill, now=seq.deadline + 1)
 
         assert seq.status == TIMEOUT
         assert seq.block_table == []                  # 已分配的 chunk block 被回收

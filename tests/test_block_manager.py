@@ -29,7 +29,8 @@ def run_prefill_and_hash(bm: BlockManager, seq: Sequence):
     assert num_cached != -1
     bm.allocate(seq, num_cached)
     seq.num_scheduled_tokens = seq.num_tokens - seq.num_cached_tokens
-    bm.hash_blocks(seq)
+    # Day8：hash_blocks 改为显式区间 [start, end)，完整 prefill 即 [0, num_tokens)
+    bm.hash_blocks(seq, 0, seq.num_tokens)
 
 
 class TestAllocate:
@@ -107,7 +108,7 @@ class TestPrefixCache:
         seq = make_seq(20)  # 2 个完整块 + 1 个半空块
         bm.allocate(seq, 0)
         seq.num_scheduled_tokens = 20
-        bm.hash_blocks(seq)
+        bm.hash_blocks(seq, 0, 20)  # Day8 显式区间
 
         h0 = BlockManager.compute_hash(seq.block(0), -1)
         b0, b1, b2 = (bm.blocks[b] for b in seq.block_table)
