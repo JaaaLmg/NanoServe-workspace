@@ -47,12 +47,15 @@ ENGINE_LOGGER = logging.getLogger("nanovllm.engine.llm_engine")
 # 事件字段白名单（Day8 版本：engine_round 增加 prefill_chunks）
 EVENT_FIELDS = {
     "scheduler_round": {"event", "round_id", "phase", "token_budget", "max_num_seqs",
-                        "planned_tokens", "scheduled_requests", "budget_deferred_direct",
-                        "budget_deferred_hol", "budget_deferred_requests",
-                        "observed_at", "decisions"},
+                        "planned_tokens", "prefill_tokens", "decode_tokens",
+                        "prefill_items", "decode_items", "scheduled_requests",
+                        "needed_first",
+                        "budget_deferred_direct", "budget_deferred_hol",
+                        "budget_deferred_requests", "observed_at", "decisions"},
     "engine_round": {"event", "round_id", "phase", "token_budget", "planned_tokens",
                      "executed_tokens", "model_called", "outcome", "observed_at",
-                     "prefill_chunks"},
+                     "prefill_chunks", "prefill_items", "decode_items",
+                     "prefill_tokens", "decode_tokens"},
     "budget_wait_episode": {"event", "seq_id", "request_id", "started_at", "ended_at",
                             "duration_seconds", "close_reason", "round_id", "observed_at"},
     "request_budget_wait": {"event", "seq_id", "request_id", "budget_deferred_rounds",
@@ -60,7 +63,7 @@ EVENT_FIELDS = {
                             "round_id", "observed_at"},
 }
 KNOWN_REASONS = {"scheduled", "budget", "sequence_cap", "kv_capacity",
-                 "head_of_line", "phase_priority", "paused"}
+                 "head_of_line", "decode_priority", "paused"}
 
 
 class JsonlCapture(logging.Handler):
@@ -94,13 +97,11 @@ class JsonlCapture(logging.Handler):
 
 
 def make_stub_runner(sampled_token: int = 7):
-    def call(method, seqs, is_prefill):
-        # Day8 提交契约：中间 chunk 无采样 token；最后 chunk / decode 每序列 1 token
-        if not is_prefill:
-            return [sampled_token] * len(seqs)
-        n = sum(1 for s in seqs
-                if s.prefill_offset + s.num_scheduled_tokens == s.prefill_target)
-        return [sampled_token] * n if n else None
+    def call(method, items_):
+        # Day8/9 提交契约：按 needs_sample 快照（decode 恒采样、prefill 仅最后
+        # chunk 采样）返回 token；本轮无任何采样时返回 None
+        out = [sampled_token for it in items_ if it.needs_sample]
+        return out if out else None
     return call
 
 
@@ -167,8 +168,11 @@ def validate_events(events: list[dict], chunk_size: int | None = None) -> list[s
         if kind == "engine_round" and e["outcome"] == "completed":
             rid = e["round_id"]
             s = sched_rounds.get(rid)
+            # Day9：prefill_chunks = prefill 子批 item 数（纯 prefill 与 mixed 轮均有）
             expected_chunks = sum(1 for d in (s or {}).get("decisions", [])
-                                  if d["reason"] == "scheduled") if s and s["phase"] == "prefill" else 0
+                                  if d["reason"] == "scheduled"
+                                  and d.get("phase") == "prefill") \
+                if s and s["phase"] in ("prefill", "mixed") else 0
             if e["prefill_chunks"] != expected_chunks:
                 problems.append(
                     f"round {rid}: prefill_chunks={e['prefill_chunks']} 与调度决策 {expected_chunks} 不一致")

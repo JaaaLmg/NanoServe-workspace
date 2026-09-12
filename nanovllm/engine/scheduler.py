@@ -12,12 +12,15 @@ from nanovllm.engine.block_manager import BlockManager
 logger = logging.getLogger(__name__)
 
 # ---------- 本轮决策原因（§5.1 原因分类：不把所有等待都算 budget） ----------
+# Day9 混合轮归因重构：phase_priority（"整轮被另一阶段占用"）随 decode-first
+# 调度废除——running decode 与 waiting prefill 可同轮共存；新增 decode_priority
+# 表达"预算被同轮 decode 优先占用"这一混合轮特有的让路原因
 REASON_SCHEDULED = "scheduled"            # 实际接纳正 token 工作（含首请求部分 chunk）
 REASON_BUDGET = "budget"                  # 队首/候选需求大于 remaining，或预算已耗尽
 REASON_SEQUENCE_CAP = "sequence_cap"      # 序列数上限先阻止接纳（与 budget 同现时优先）
 REASON_KV_CAPACITY = "kv_capacity"        # 已查询候选但 KV 容量不足或被 KV 抢占
 REASON_HEAD_OF_LINE = "head_of_line"      # 前序请求处停止，尾部未独立检查预算/KV
-REASON_PHASE_PRIORITY = "phase_priority"  # 本轮已有 prefill，running 未成为 decode 候选
+REASON_DECODE_PRIORITY = "decode_priority"  # 预算被同轮 decode 优先占用（D>0 且需求<=B）
 REASON_PAUSED = "paused"                  # 独立 PREEMPTED，尚未恢复
 
 
@@ -28,6 +31,9 @@ class RoundDecision:
     seq_id: int
     request_id: str
     reason: str
+    # 本请求在本轮的角色：prefill 候选 / decode 候选（Day9 混合轮逐请求阶段标注；
+    # paused 请求恢复后按 prefill recompute，同样记 "prefill"）
+    phase: str = "prefill"
     # 本轮希望推进的输入 token 数；未成为候选或 KV 查询失败时为 None（不虚构需求）
     needed_tokens: int | None = None
     # 实际接纳的正 token 数；延后为 0
@@ -53,6 +59,7 @@ class RoundDecision:
         return {
             "seq_id": self.seq_id,
             "request_id": self.request_id,
+            "phase": self.phase,
             "needed_tokens": self.needed_tokens,
             "scheduled_tokens": self.scheduled_tokens,
             "reason": self.reason,
@@ -82,6 +89,31 @@ class BudgetWaitStats:
     budget_wait_started_at: float | None = None
     # 已结算（closed）的预算等待秒数；开放时段不重复计入
     budget_wait_seconds: float = 0.0
+
+
+@dataclass
+class BatchItem:
+    """单个请求在本调度轮的执行计划（Day9 混合批次的逐请求阶段标注）。
+
+    - 批次是 items 有序列表：decode item 在前、prefill item 在后（与调度顺序、
+      执行子批顺序一致），同 phase 内保持各自队列的 FCFS 顺序；
+    - 仅 rank 0 侧结构：经 model_runner.call("run", items) 广播（dataclass 默认
+      pickle，seq 字段走 Sequence v3 协议），不进入 Sequence.__getstate__ payload，
+      pickle 协议版本不变；
+    - phase 是批次阶段的单一权威（Sequence.is_prefill 只是请求侧镜像标记）；
+    - needs_sample 在调度接纳时按计划快照冻结（decode 恒 True；prefill 等于
+      is_last_chunk，即中间 chunk 不采样），postprocess 以它与 token 注入列表
+      一一对齐——不再从全批布尔推导，这是混合轮采样对齐的依据；
+    - round_id 用于 postprocess 的迟到/重复结果关联校验（双保险之一）。
+    """
+
+    seq: Sequence
+    phase: str               # "prefill" | "decode"
+    scheduled_tokens: int    # prefill 为 q（0 < q <= chunk_size）；decode 恒为 1
+    offset_before: int | None = None   # prefill：接纳时刻的 prefill_offset；decode 为 None
+    is_last_chunk: bool = False        # prefill：接纳即完成 prefill；decode 恒为 False
+    needs_sample: bool = False         # decode 恒 True；prefill 等于 is_last_chunk
+    round_id: int = 0                  # 接纳时的调度轮次 ID
 
 
 def _log_event(payload: dict):
@@ -451,6 +483,8 @@ class Scheduler:
         首个未处理请求，blocking_reason 说明停止原因。
         若队首是本轮刚分块、尚未完成 prefill 的请求（已有 scheduled 决策），
         则从其后第一个未处理请求开始归因，避免同一请求获得两条决策。
+        直接原因可能是 decode_priority（Day9：预算被同轮 decode 优先占用），
+        尾部 HOL 的 blocking_reason 原样跟随，保证归因可独立复算。
         """
         first = None
         for seq in self.waiting:
@@ -462,14 +496,15 @@ class Scheduler:
         decided.add(first.seq_id)
         decisions.append(RoundDecision(
             first.seq_id, first.request_id, reason,
-            needed_tokens=needed, kv_checked=kv_checked))
+            needed_tokens=needed, kv_checked=kv_checked, phase="prefill"))
         for seq in list(self.waiting):
             if seq.seq_id in decided:
                 continue
             decided.add(seq.seq_id)
             decisions.append(RoundDecision(
                 seq.seq_id, seq.request_id, REASON_HEAD_OF_LINE,
-                blocking_reason=reason, blocked_by_seq_id=first.seq_id))
+                blocking_reason=reason, blocked_by_seq_id=first.seq_id,
+                phase="prefill"))
 
     def _record_budget_decisions(self, decisions: list[RoundDecision], now: float,
                                  round_id: int) -> tuple[int, int]:
@@ -478,7 +513,8 @@ class Scheduler:
         - direct：主原因即为 budget 的请求数；
         - hol：主原因为 head_of_line 且 blocking_reason=budget 的请求数；
         - 两者之和（本轮天然去重）即 budget_deferred_requests；
-        - KV/sequence_cap/phase_priority/paused 不计入预算人数。
+        - KV/sequence_cap/decode_priority/paused 不计入预算人数
+          （decode_priority 是优先级策略的让路，不是预算的锅，§3.5）。
         """
         direct = hol = 0
         for d in decisions:
@@ -511,42 +547,73 @@ class Scheduler:
             if seq.status == SequenceStatus.PREEMPTED and seq.seq_id not in decided:
                 decided.add(seq.seq_id)
                 decisions.append(RoundDecision(
-                    seq.seq_id, seq.request_id, REASON_PAUSED))
+                    # paused 请求恢复后按 prefill recompute 重新入队，角色记 "prefill"
+                    seq.seq_id, seq.request_id, REASON_PAUSED, phase="prefill"))
 
-    def _finalize_round(self, batch: list[Sequence], is_prefill: bool, phase: str,
-                        decisions: list[RoundDecision], now: float) -> tuple[list[Sequence], bool]:
-        """轮末收尾：以 batch 实际字段重算校验 -> 更新统计 -> 记录计划日志。"""
+    def _finalize_round(self, items: list[BatchItem], phase: str,
+                        decisions: list[RoundDecision], now: float,
+                        needed_first: int | None = None) -> tuple[list[BatchItem], str]:
+        """轮末收尾：以 items 实际字段重算校验 -> 更新统计 -> 记录计划日志。
+
+        Day9 混合预算口径（§3.3/§5.2 不变量 14）：
+            planned = sum(prefill q_i) + count(decode items) <= B
+        四条上限独立显式校验（互不替代）：q_i 正整数、prefill q_i <= chunk_size、
+        总量 <= B、条数 <= max_num_seqs；另校验 decode item 恒为 1、seq_id 去重
+        （同一请求每轮至多一个 item，不允许同轮同时 prefill+decode）。
+        needed_first 记入事件供验收方独立复算 decode_priority 判定条件（§3.5）。
+        """
         round_id = self._current_round_id
-        # 每轮末以 batch 的实际字段重算，不只信任循环局部变量（§4.2）
-        planned = sum(seq.num_scheduled_tokens for seq in batch)
-        if batch:
-            if any(type(seq.num_scheduled_tokens) is not int
-                   or seq.num_scheduled_tokens <= 0 for seq in batch):
+        # 每轮末以 items 的实际字段重算，不只信任循环局部变量（§4.2）
+        prefill_items = [it for it in items if it.phase == "prefill"]
+        decode_items = [it for it in items if it.phase == "decode"]
+        planned = sum(it.scheduled_tokens for it in prefill_items) + len(decode_items)
+        if items:
+            # 阶段合法性：BatchItem.phase 是批次阶段权威，未知值在此显式拒绝
+            if any(it.phase not in ("prefill", "decode") for it in items):
+                raise ValueError(
+                    f"round {round_id}: 批次存在未知 phase 的 item: "
+                    f"{sorted({it.phase for it in items} - {'prefill', 'decode'})}")
+            if any(type(it.scheduled_tokens) is not int
+                   or it.scheduled_tokens <= 0 for it in items):
                 raise ValueError(
                     f"round {round_id}: num_scheduled_tokens 必须为正整数")
-            if planned <= 0 or any(seq.num_scheduled_tokens <= 0 for seq in batch):
+            if planned <= 0:
                 raise ValueError(
-                    f"round {round_id}: 非空批次存在非正的 num_scheduled_tokens "
-                    f"（planned={planned}）")
+                    f"round {round_id}: 非空批次计划总量为 {planned}")
+            # decode item 的单位约束：每条每轮恒为 1 token（§3.3）
+            bad_decode = [it.seq.seq_id for it in decode_items
+                          if it.scheduled_tokens != 1]
+            if bad_decode:
+                raise ValueError(
+                    f"round {round_id}: decode item 的接纳数必须为 1，"
+                    f"违规序列 {bad_decode}")
+            # 混合预算：decode 占用量 + prefill query 总量不得超过 B
             if planned > self.max_num_batched_tokens:
                 raise ValueError(
                     f"round {round_id}: 计划 token {planned} 超过预算 "
                     f"{self.max_num_batched_tokens}")
-            if len(batch) > self.max_num_seqs:
+            if len(items) > self.max_num_seqs:
                 raise ValueError(
-                    f"round {round_id}: 批次序列数 {len(batch)} 超过上限 {self.max_num_seqs}")
-            # Day8：chunk_size 上限与预算/序列数独立校验（四条独立，互不替代）。
-            # 每请求每轮接纳的 prefill query 数不得超过 chunk_size（decode 恒为 1，
-            # 天然满足，无需区分阶段）
-            over_chunk = [seq.seq_id for seq in batch
-                          if seq.num_scheduled_tokens > self.chunk_size]
+                    f"round {round_id}: 批次条目数 {len(items)} 超过上限 "
+                    f"{self.max_num_seqs}")
+            # Day8：chunk_size 上限与预算/序列数独立校验（decode q=1 天然满足，
+            # 显式只查 prefill item）
+            over_chunk = [it.seq.seq_id for it in prefill_items
+                          if it.scheduled_tokens > self.chunk_size]
             if over_chunk:
                 raise ValueError(
                     f"round {round_id}: 序列 {over_chunk} 的单轮接纳数超过 "
                     f"chunk_size={self.chunk_size}")
-            seq_ids = [seq.seq_id for seq in batch]
+            seq_ids = [it.seq.seq_id for it in items]
             if len(set(seq_ids)) != len(seq_ids):
                 raise ValueError(f"round {round_id}: 批次内 seq_id 重复: {seq_ids}")
+            # 计划快照与 seq 实际字段一致性：BatchItem 是调度产物，二者不允许漂移
+            mismatched = [it.seq.seq_id for it in items
+                          if it.seq.num_scheduled_tokens != it.scheduled_tokens]
+            if mismatched:
+                raise ValueError(
+                    f"round {round_id}: BatchItem 计划量与 seq.num_scheduled_tokens "
+                    f"不一致: {mismatched}")
         direct, hol = self._record_budget_decisions(decisions, now, round_id)
         stats = {
             "event": "scheduler_round",
@@ -555,7 +622,15 @@ class Scheduler:
             "token_budget": self.max_num_batched_tokens,
             "max_num_seqs": self.max_num_seqs,
             "planned_tokens": planned,
-            "scheduled_requests": len(batch),
+            # Day9 分阶段计划量：decode_tokens 即 decode 条数（每条 1 token）
+            "prefill_tokens": sum(it.scheduled_tokens for it in prefill_items),
+            "decode_tokens": len(decode_items),
+            "prefill_items": len(prefill_items),
+            "decode_items": len(decode_items),
+            "scheduled_requests": len(items),
+            # Day9 归因依据：本轮首个被考察的 prefill 候选的需求（不变量 18 的
+            # needed_first），供 decode_priority 判定条件独立复算；无成功估算时为 None
+            "needed_first": needed_first,
             "budget_deferred_direct": direct,
             "budget_deferred_hol": hol,
             "budget_deferred_requests": direct + hol,
@@ -565,15 +640,92 @@ class Scheduler:
         self.last_schedule_stats = stats
         _log_event(stats)
         self._current_round_id = None
-        return batch, is_prefill
+        return items, phase
 
     # ---------- 调度主流程 ----------
 
-    def schedule(self, *, now: float | None = None) -> tuple[list[Sequence], bool]:
-        """制定一轮调度计划，返回 (批次, 是否 prefill)（接口与 Day6 兼容）。
+    def _schedule_decode_phase(self, *, round_id: int, budget: int, used: int,
+                               decisions: list[RoundDecision], decided: set[int],
+                               now: float) -> tuple[list[BatchItem], int]:
+        """decode 阶段（decode-first，§3.4 阶段 1）：先占预算与名额。
 
-        预算口径：本轮模型输入 query token 总量 planned_tokens <= B，
-        且非空批次每条 num_scheduled_tokens 为正整数；decode 同样受预算约束。
+        按 running 队列顺序（阶段内 FCFS）选择；先检查剩余预算与序列数上限，
+        达标前不 popleft / 不 may_append / 不抢占；延后请求原地保留 RUNNING、
+        token、KV 与相对顺序。返回 (decode items, 更新后的 used)。
+        decisions/decided 就地追加（与 _attribute_prefill_stop 同一风格）。
+        """
+        items: list[BatchItem] = []
+        while self.running:
+            if len(items) >= self.max_num_seqs:
+                # 序列数上限先阻止接纳：其余候选延后（限制来自 cap，不能伪记为 budget）
+                for seq in self.running:
+                    decided.add(seq.seq_id)
+                    decisions.append(RoundDecision(
+                        seq.seq_id, seq.request_id, REASON_SEQUENCE_CAP, phase="decode"))
+                break
+            if used >= budget:
+                # 预算耗尽：decode 候选的单位需求恒为 1（已知），
+                # 其余 RUNNING 候选均按直接 budget 记录，不再查询 KV
+                for seq in self.running:
+                    decided.add(seq.seq_id)
+                    decisions.append(RoundDecision(
+                        seq.seq_id, seq.request_id, REASON_BUDGET,
+                        needed_tokens=1, phase="decode"))
+                break
+            seq = self.running.popleft()
+            while not self.block_manager.can_append(seq):
+                # 块不足：抢占合法 RUNNING 请求释放资源（KV 原因，不算预算拒绝）。
+                # preempt 只做抢占，resume 立即让它以 WAITING 身份回到等待队列
+                if self.running:
+                    victim = self.running.pop()
+                    self.preempt(victim, now=now)
+                    self.resume(victim)
+                    decided.add(victim.seq_id)
+                    decisions.append(RoundDecision(
+                        victim.seq_id, victim.request_id, REASON_KV_CAPACITY,
+                        kv_checked=True, phase="decode"))
+                else:
+                    self.preempt(seq, now=now)
+                    self.resume(seq)
+                    decided.add(seq.seq_id)
+                    decisions.append(RoundDecision(
+                        seq.seq_id, seq.request_id, REASON_KV_CAPACITY,
+                        needed_tokens=1, kv_checked=True, phase="decode"))
+                    break
+            else:
+                seq.num_scheduled_tokens = 1
+                seq.is_prefill = False
+                self.block_manager.may_append(seq)
+                used += 1
+                decided.add(seq.seq_id)
+                decisions.append(RoundDecision(
+                    seq.seq_id, seq.request_id, REASON_SCHEDULED,
+                    needed_tokens=1, scheduled_tokens=1, kv_checked=True,
+                    phase="decode"))
+                items.append(BatchItem(
+                    seq=seq, phase="decode", scheduled_tokens=1,
+                    offset_before=None, is_last_chunk=False,
+                    needs_sample=True, round_id=round_id))
+        # 沿用既有规则：已选择的 decode 批次恢复至 running 队首；
+        # 延后请求保持相对顺序跟在后面，不引入轮转公平策略
+        self.running.extendleft(reversed([it.seq for it in items]))
+        return items, used
+
+    def schedule(self, *, now: float | None = None) -> tuple[list[BatchItem], str]:
+        """制定一轮调度计划，返回 (items, phase)（Day9 混合批次接口）。
+
+        混合预算口径（§3.3）：
+            planned_tokens = sum(prefill q_i) + count(decode items) <= B
+        且非空批次每条 num_scheduled_tokens 为正整数；decode item 恒为 1。
+
+        调度策略 decode-first（§3.4）：同一轮内 decode 先于 prefill 分配预算与
+        序列名额——已有 decode 请求的推进不被长 prefill 独占 GPU 挤掉（结构性
+        保底，无需保留比例配置）；prefill 使用 decode 之后的剩余预算，接纳规则
+        （首候选拆分/后续整段/FCFS 不跳过/扫描位置与队列分离）沿用 Day8。
+        phase ∈ {"prefill", "decode", "mixed", "idle"}，纯阶段是混合的退化特例。
+        归因（§3.5/§5.2 不变量 18）：prefill 候选延后时，decode_priority 仅当
+        "D > 0 且 needed_first <= B"——needed_first 是本轮首个被考察的 prefill
+        候选的需求（含未被接纳即停止的情形），不是被延后候选自己的需求。
         时间语义：整轮使用一次单调时钟 now（可注入确定值用于测试）。
         """
         if now is None:
@@ -591,23 +743,59 @@ class Scheduler:
         self.check_deadlines(now)
 
         budget = self.max_num_batched_tokens
-        batch: list[Sequence] = []
-        used = 0  # U：本轮已承诺的输入 token 数
+        items: list[BatchItem] = []
+        used = 0  # U：本轮已承诺的输入 token 数（decode + prefill 同一口径）
         decisions: list[RoundDecision] = []
         decided: set[int] = set()
 
-        # ---------- prefill：按 waiting 当前顺序（阶段内 FCFS）尝试接纳 ----------
+        # ---------- 阶段 1：decode（decode-first，先占预算与名额，§3.4） ----------
+        decode_items, used = self._schedule_decode_phase(
+            round_id=round_id, budget=budget, used=used,
+            decisions=decisions, decided=decided, now=now)
+        items.extend(decode_items)
+
+        # ---------- 阶段 2：prefill（使用 decode 之后的剩余预算与名额） ----------
+        # decode_used 是 decode_priority 归因的判据：本轮 decode 实际占用量
+        decode_used = used
+        prefill_admitted = False  # prefill 阶段是否已有接纳（首候选才允许拆分）
+        # needed_first（§3.5/不变量 18）：本轮首个被考察的 prefill 候选的需求。
+        # 在第一次成功估算时记录（含后续未接纳即停止的情形）；为 None 表示本轮
+        # 尚无成功估算（首个候选即 KV 不足停止，此时不会有 budget/decode_priority
+        # 归因发生）。decode_priority 判定统一使用该值，与设计字面规则一致
+        needed_first: int | None = None
         # Day8：扫描位置与队列分离——中间 chunk 的请求保持 WAITING 原地
         # （保留 block_table 与已提交进度），但本轮不再被扫描
         # （每请求每轮至多一个 chunk）；扫描位置前进，后续请求仍按 FCFS 考察
         scan = 0
-        while self.waiting and len(batch) < self.max_num_seqs and scan < len(self.waiting):
+        while self.waiting and len(items) < self.max_num_seqs and scan < len(self.waiting):
             seq = self.waiting[scan]
             remaining = budget - used
             if remaining == 0:
-                # 预算恰好耗尽（未命中序列数上限）：首个未处理请求记 budget，
-                # 无需查询 KV，不虚构其需求与 KV 可行性；尾部记预算 HOL。
-                # 若首个未处理请求是本轮刚分块的请求（已有 scheduled 决策），归因自动跳过它
+                # 预算恰好耗尽（未命中序列数上限）：首个未处理请求归因。
+                # D==0 时沿用 Day7 口径：budget、不查询 KV、不虚构需求；
+                # D>0 时按不变量 18 判定：needed_first <= B 记 decode_priority
+                #（预算短缺纯由 decode 优先造成），否则记 budget（首候选自身
+                # 规模已超预算，延后并非 decode 造成）。
+                # 若该候选本身就是本轮首个被考察的候选（尚无估算），此刻补一次
+                # 只读估算，其需求如实入档；若 needed_first 已来自更早的候选，
+                # 本候选未做估算，needed 记 None（不虚构需求）。KV 不足仍记
+                # kv_capacity
+                if decode_used > 0:
+                    estimated_here = needed_first is None
+                    if estimated_here:
+                        _, needed_first = self._estimate_prefill_tokens(seq)
+                        if needed_first is None:
+                            self._attribute_prefill_stop(decisions, decided,
+                                                         reason=REASON_KV_CAPACITY,
+                                                         needed=None, kv_checked=True)
+                            break
+                    reason = (REASON_DECODE_PRIORITY if needed_first <= budget
+                              else REASON_BUDGET)
+                    self._attribute_prefill_stop(
+                        decisions, decided, reason=reason,
+                        needed=needed_first if estimated_here else None,
+                        kv_checked=estimated_here and not seq.block_table)
+                    break
                 self._attribute_prefill_stop(decisions, decided, reason=REASON_BUDGET,
                                              needed=None, kv_checked=False)
                 break
@@ -617,17 +805,23 @@ class Scheduler:
                 self._attribute_prefill_stop(decisions, decided, reason=REASON_KV_CAPACITY,
                                              needed=None, kv_checked=True)
                 break
+            if needed_first is None:
+                needed_first = needed
             # Day8：计划 chunk q = min(剩余需求, chunk_size, 剩余预算)。
             # chunk_size 与 B 是两条独立上限：首候选允许 q < 需求（拆分）；
             # 后续候选必须整段放下（q == needed），否则停止扫描（FCFS 不跳过，
             # 不绕过它去接纳更短尾部）。chunk_size 造成的部分推进不产生新的
-            # 等待原因——被拆分候选本身记 scheduled，放不下的后续候选沿用
-            # Day7 的 budget 归因口径
+            # 等待原因——被拆分候选本身记 scheduled；放不下的后续候选按
+            # 不变量 18 归因（decode_priority 仅当 D>0 且 needed_first<=B）
             q = min(needed, self.chunk_size, remaining)
-            if q < needed and batch:
-                # 非首候选放不下：整请求延后（记录已算出的需求），停止扫描
-                self._attribute_prefill_stop(decisions, decided, reason=REASON_BUDGET,
-                                             needed=needed, kv_checked=not seq.block_table)
+            if q < needed and prefill_admitted:
+                # 非首候选放不下：整请求延后（记录该候选自己的需求），停止扫描
+                reason = (REASON_DECODE_PRIORITY
+                          if (decode_used > 0 and needed_first is not None
+                              and needed_first <= budget) else REASON_BUDGET)
+                self._attribute_prefill_stop(decisions, decided, reason=reason,
+                                             needed=needed,
+                                             kv_checked=not seq.block_table)
                 break
             # 接纳：此刻才分配 block、设置正 token 数并扣减预算
             # kv_checked 在分配前捕获（allocate 会填充 block_table 并设置初始 offset）
@@ -642,19 +836,28 @@ class Scheduler:
             self._prefill_chunk_count[seq.seq_id] = chunk_index
             offset_before = seq.prefill_offset
             seq.num_scheduled_tokens = q
+            seq.is_prefill = True
             used += q
+            prefill_admitted = True
             decided.add(seq.seq_id)
+            # "本轮接纳即完成 prefill"判定改用 Sequence 具名谓词（Day9 单一权威）
+            is_last = seq.is_last_chunk_scheduled
             decisions.append(RoundDecision(
                 seq.seq_id, seq.request_id, REASON_SCHEDULED,
                 needed_tokens=needed, scheduled_tokens=q,
                 kv_checked=kv_checked,
                 chunk_index=chunk_index,
                 offset_before=offset_before,
-                is_last_chunk=offset_before + q == seq.prefill_target))
-            if offset_before + q == seq.prefill_target:
+                is_last_chunk=is_last, phase="prefill"))
+            items.append(BatchItem(
+                seq=seq, phase="prefill", scheduled_tokens=q,
+                offset_before=offset_before, is_last_chunk=is_last,
+                needs_sample=is_last, round_id=round_id))
+            if is_last:
                 # prefill 完成才算被调度接纳：WAITING -> RUNNING 走统一迁移入口
-                # （迁移条件与 Day7 一致：offset + q == prefill_target，
-                # 即最后一个 chunk 被接纳）；中间 chunk 仍保持 WAITING
+                # （迁移条件与 Day7/8 一致：最后一个 chunk 被接纳）；中间 chunk
+                # 仍保持 WAITING。本轮不再有该请求的 decode item——其首个
+                # completion token 由最后 chunk 的采样产生（§3.4 设计要点 3）
                 seq.transition_to(SequenceStatus.RUNNING)
                 # 扫描位置可能已越过队首（前面驻留中间 chunk 请求），按对象移除
                 self.waiting.remove(seq)
@@ -662,133 +865,86 @@ class Scheduler:
             else:
                 # 中间 chunk：本轮不再扫描该请求，扫描位置前进越过它
                 scan += 1
-            batch.append(seq)
 
-        if self.waiting and len(batch) >= self.max_num_seqs:
+        if self.waiting and len(items) >= self.max_num_seqs:
             # 序列数上限先阻止了继续扫描（与预算同时命中时优先记 sequence_cap）：
             # 队首记 sequence_cap，其余记 sequence_cap HOL，不计入预算人数
             self._attribute_prefill_stop(decisions, decided, reason=REASON_SEQUENCE_CAP,
                                          needed=None, kv_checked=False)
 
-        if batch:
-            # 本轮已有 prefill：整轮返回 prefill，running 未参与 decode 候选。
-            # 未选 running 是 phase_priority，不是 budget；预算余量可以留空。
-            # 注意跳过本轮刚从 waiting 转入 running 的批次成员（已记 scheduled）
-            for seq in self.running:
-                if seq.seq_id in decided:
-                    continue
-                decided.add(seq.seq_id)
-                decisions.append(RoundDecision(
-                    seq.seq_id, seq.request_id, REASON_PHASE_PRIORITY))
-            self._record_paused_decisions(decisions, decided)
-            return self._finalize_round(batch, True, "prefill", decisions, now)
-
-        # ---------- decode：按 running 队列顺序（阶段内 FCFS）选择 ----------
-        # 先检查剩余预算与序列数上限，达标前不 popleft / 不 may_append / 不 preempt；
-        # 延后请求原地保留 RUNNING、token、KV 与相对顺序
-        while self.running:
-            if len(batch) >= self.max_num_seqs:
-                # 序列数上限先阻止接纳：其余候选延后（限制来自 cap，不能伪记为 budget）
-                for seq in self.running:
-                    decided.add(seq.seq_id)
-                    decisions.append(RoundDecision(
-                        seq.seq_id, seq.request_id, REASON_SEQUENCE_CAP))
-                break
-            if used >= budget:
-                # 预算耗尽：decode 候选的单位需求恒为 1（已知），
-                # 其余 RUNNING 候选均按直接 budget 记录，不再查询 KV
-                for seq in self.running:
-                    decided.add(seq.seq_id)
-                    decisions.append(RoundDecision(
-                        seq.seq_id, seq.request_id, REASON_BUDGET, needed_tokens=1))
-                break
-            seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
-                # 块不足：抢占合法 RUNNING 请求释放资源（KV 原因，不算预算拒绝）。
-                # preempt 只做抢占，resume 立即让它以 WAITING 身份回到等待队列
-                if self.running:
-                    victim = self.running.pop()
-                    self.preempt(victim, now=now)
-                    self.resume(victim)
-                    decided.add(victim.seq_id)
-                    decisions.append(RoundDecision(
-                        victim.seq_id, victim.request_id, REASON_KV_CAPACITY,
-                        kv_checked=True))
-                else:
-                    self.preempt(seq, now=now)
-                    self.resume(seq)
-                    decided.add(seq.seq_id)
-                    decisions.append(RoundDecision(
-                        seq.seq_id, seq.request_id, REASON_KV_CAPACITY,
-                        needed_tokens=1, kv_checked=True))
-                    break
-            else:
-                seq.num_scheduled_tokens = 1
-                seq.is_prefill = False
-                self.block_manager.may_append(seq)
-                used += 1
-                decided.add(seq.seq_id)
-                decisions.append(RoundDecision(
-                    seq.seq_id, seq.request_id, REASON_SCHEDULED,
-                    needed_tokens=1, scheduled_tokens=1, kv_checked=True))
-                batch.append(seq)
-        # 沿用既有规则：已选择的 decode 批次恢复至 running 队首；
-        # 延后请求保持相对顺序跟在后面，不引入轮转公平策略
-        self.running.extendleft(reversed(batch))
-
         # 独立 PREEMPTED（不在任何队列）本轮不可执行：记 paused，不算预算等待
         self._record_paused_decisions(decisions, decided)
 
-        phase = "decode" if batch else "idle"
-        return self._finalize_round(batch, False, phase, decisions, now)
+        # 轮级 phase 标签：混合轮 = decode 与 prefill item 同时存在（§3.1）
+        has_prefill = any(it.phase == "prefill" for it in items)
+        has_decode = any(it.phase == "decode" for it in items)
+        if has_prefill and has_decode:
+            phase = "mixed"
+        elif has_prefill:
+            phase = "prefill"
+        elif has_decode:
+            phase = "decode"
+        else:
+            phase = "idle"
+        return self._finalize_round(items, phase, decisions, now,
+                                    needed_first=needed_first)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int] | None,
-                    is_prefill: bool, now: float | None = None):
-        """模型执行返回后的收尾：安全检查 -> 原子提交 chunk 进度 -> 完成判定。
+    def postprocess(self, items: list[BatchItem], token_ids: list[int] | None,
+                    now: float | None = None):
+        """模型执行返回后的收尾（Day9 逐 item 提交契约 §4.3）。
 
-        Day8 提交契约（§4.5）：
-        - token 数显式校验：prefill 轮只有"最后 chunk"（offset + q == target）
-          的请求产出采样 token，中间 chunk 不采样；decode 轮每序列 1 token。
-          run() 对"本轮无任何采样"返回 None，这里与空列表同价。数量不匹配
-          显式抛错，不使用会静默截断的 zip。
-        - 批次快照一致（先整批校验再逐个提交，避免半提交状态）：活动请求必须
-          带有本轮调度设置的待执行计划（num_scheduled_tokens > 0）；计数已
-          清零说明本批次是重复/迟到的旧 postprocess，拒绝推进进度。
-        - 原子性：每个 chunk 只被成功执行它的这一轮提交一次；取消/超时/
-          终态不推进 offset；提交后立即校验单调有界（offset <= target）。
+        - round 关联校验（双保险之一）：items 携带的 round_id 必须与最近一次
+          调度轮一致；含活动请求的批次不匹配即显式拒绝——修复 Day8 审查 §4.4
+          指出的"旧批次重放时同 seq 已被重新规划，会以当前计划二次提交"缺陷。
+          全终态批次豁免该校验：其请求已被安全路径幂等清理，携带的 token 无意义，
+          重放是安全空操作（沿用 Day6/7 所有权测试依赖的契约）。
+        - token 数显式校验：与 sum(item.needs_sample) 一致。needs_sample 是调度
+          接纳时冻结的快照（decode 恒 True；prefill 等于 is_last_chunk），与
+          ModelRunner 合并结果的顺序契约共享同一权威，不使用会静默截断的 zip。
+          run() 对"本轮无任何采样"返回 None，这里与空列表同价。
+        - 原子性/幂等（沿用 Day8 §4.5）：先整批校验再逐个提交；取消/超时/终态
+          不推进 offset；提交后立即校验单调有界；重复/迟到收尾被拒。
+        - 混合轮新增约束：单个 item 的终态不影响同轮其他 item 的提交。
         """
         if now is None:
             now = perf_counter()
+        seqs = [it.seq for it in items]
+        # 含活动请求标记：round 关联校验与 token 数校验共用同一谓词（审查 §4.2）
+        has_live = any(not s.is_terminal for s in seqs)
+        # ---------- round 关联校验（仅对含活动请求的批次强制，§4.3 前置校验 1） ----------
+        if has_live:
+            last_round = (self.last_schedule_stats or {}).get("round_id")
+            if last_round is None or any(it.round_id != last_round for it in items):
+                raise ValueError(
+                    "postprocess 批次与最近调度轮不匹配（round_id 关联校验失败），"
+                    "疑似重复或迟到的旧批次结果，已拒绝提交")
         samples = list(token_ids) if token_ids is not None else []
-        # 需采样请求集合：必须在任何状态变更前按调度快照计算——
-        # prefill 轮 = offset + q == prefill_target（最后 chunk）；
-        # decode 轮 = 全部。安全检查丢弃的采样在 token_ids 中仍占位，
-        # 游标推进与安全检查解耦，保证对齐关系不因丢弃而错位
-        needs_sample = [
-            (not is_prefill)
-            or (seq.prefill_offset + seq.num_scheduled_tokens == seq.prefill_target)
-            for seq in seqs
-        ]
+        # 需采样集合：按调度快照 BatchItem.needs_sample 逐 item 对齐——
+        # 安全检查丢弃的采样在 token_ids 中仍占位，游标推进与安全检查解耦，
+        # 保证对齐关系不因丢弃而错位（Day8 原则的逐 item 版本）
+        needs_sample = [it.needs_sample for it in items]
         # 全终态批次（纯迟到重放）不校验 token 数：其请求已被安全路径幂等清理，
         # 携带的 token 无意义；Day6/Day7 所有权测试依赖"全终态旧批次重放是
         # 安全空操作"。含活动请求的批次必须与调度计划严格一致
-        has_live = any(not seq.is_terminal for seq in seqs)
         if has_live and len(samples) != sum(needs_sample):
             raise ValueError(
                 f"postprocess 采样 token 数与需采样请求数不一致：得到 {len(samples)}，"
-                f"期望 {sum(needs_sample)}（is_prefill={is_prefill}，批次 {len(seqs)}）")
-        for seq in seqs:
-            if not seq.is_terminal and seq.num_scheduled_tokens <= 0:
+                f"期望 {sum(needs_sample)}（批次 {len(items)}，"
+                f"decode {sum(1 for it in items if it.phase == 'decode')} 条）")
+        for it in items:
+            if not it.seq.is_terminal and it.seq.num_scheduled_tokens <= 0:
                 raise ValueError(
-                    f"request {seq.request_id!r} (seq_id={seq.seq_id}) "
+                    f"request {it.seq.request_id!r} (seq_id={it.seq.seq_id}) "
                     f"无待执行的调度计划，疑似重复或迟到的 postprocess，已拒绝提交")
         ti = 0  # token_ids 游标
-        for seq, need in zip(seqs, needs_sample):
+        for it, need in zip(items, needs_sample):
             token_id = samples[ti] if need else None
             if need:
                 ti += 1
+            seq = it.seq
             # 安全边界（模型执行返回后、追加 token 与 KV 记账之前）：
-            # 1) 终态兜底：外部 mark_* 产生的终态请求直接清理，不参与记账；
+            # 1) 终态兜底：外部 mark_* 产生的终态请求直接清理，不参与记账，
+            #    且不影响同轮其他 item 的提交（§4.6 同轮隔离）；
             # 2) 取消标记优先于超时（客户端显式意图优先于系统判断）；
             # 3) 模型执行期间跨过 deadline 的请求不得被记为正常完成——
             #    丢弃本轮采样 token，按 TIMEOUT 终止并释放资源。
@@ -808,12 +964,13 @@ class Scheduler:
                 seq.mark_timeout("deadline_exceeded", now=now)
                 self._finalize(seq, now)
                 continue
-            # ---------- Day8 原子提交（成功路径） ----------
+            # ---------- 原子提交（成功路径，prefill/decode 统一） ----------
             offset_before = seq.prefill_offset
             q = seq.num_scheduled_tokens
             # hash_blocks 接收显式区间 [offset_before, offset_before + q)：
             # 只登记本次执行写满的完整块（中间 chunk 写满的块同样登记，
-            # 尾块永不登记）
+            # 尾块永不登记）；decode 轮区间为 [len-1, len)，与 Day7 逐 token
+            # 登记行为逐位一致
             self.block_manager.hash_blocks(seq, offset_before, offset_before + q)
             seq.prefill_offset = offset_before + q
             seq.num_scheduled_tokens = 0
@@ -822,10 +979,11 @@ class Scheduler:
                 raise ValueError(
                     f"request {seq.request_id!r}: 提交后 prefill_offset "
                     f"{seq.prefill_offset} 超过目标 {seq.prefill_target}，进度记账被破坏")
-            if is_prefill and seq.prefill_offset < seq.prefill_target:
+            if it.phase == "prefill" and seq.prefill_offset < seq.prefill_target:
                 # 中间 chunk：丢弃采样结果，保持 WAITING，下一轮延续进度
+                # （阶段分支由 item.phase 决定，替代 Day8 的全批 is_prefill）
                 continue
-            # 最后 chunk（或 decode 轮）：追加采样的首 completion；
+            # 最后 chunk（或 decode item）：追加采样的首 completion；
             # 完成判定：EOS 触发记为 stop，达到 max_tokens 记为 length；
             # mark_finished 幂等，配合 _finalize 保证不 double free
             seq.append_token(token_id)

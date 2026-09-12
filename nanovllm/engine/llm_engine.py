@@ -3,6 +3,8 @@ import json
 import logging
 from dataclasses import fields
 from time import perf_counter
+from typing import NamedTuple
+
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
@@ -21,6 +23,23 @@ def _log_event(payload: dict):
     """以 JSON Lines 发出 Engine 事件；INFO 未开启时不构造字符串。"""
     if logger.isEnabledFor(logging.INFO):
         logger.info(json.dumps(payload, ensure_ascii=False))
+
+
+class _ItemSnapshot(NamedTuple):
+    """模型调用前逐 item 快照（§4.2，rank 0 统计用途，不进 TP payload）。
+
+    postprocess 会把临时计数清零，不能在其后倒推执行工作量，因此在模型调用
+    前固化。offset_before/is_last_chunk 为 Day8 chunk 观测字段（is_last_chunk
+    决定该请求本轮是否产出采样 token），round_id 供日志关联与迟到结果核对。
+    用 NamedTuple 而非裸元组：字段自解释、按名访问，抗后续字段增删。
+    """
+    seq_id: int
+    request_id: str
+    phase: str
+    scheduled_tokens: int
+    offset_before: int | None
+    is_last_chunk: bool
+    round_id: int
 
 
 class LLMEngine:
@@ -85,49 +104,64 @@ class LLMEngine:
         if getattr(self, "_execution_failed", False):
             raise RuntimeError(
                 "模型执行已失败，当前 Engine 禁止重试；请销毁并重新创建 Engine")
-        seqs, is_prefill = self.scheduler.schedule()
-        # 调度计划快照：round_id / planned_tokens 取自 Scheduler 的本轮统计，
-        # 是计划与执行日志按 round_id 关联的唯一权威（rank 0 为统计所有者）
+        items, phase = self.scheduler.schedule()
+        # 调度计划快照：round_id / planned_tokens / 分阶段量取自 Scheduler 的本轮
+        # 统计，是计划与执行日志按 round_id 关联的唯一权威（rank 0 为统计所有者）
         sched_stats = self.scheduler.last_schedule_stats or {}
         round_id = sched_stats.get("round_id")
         budget = sched_stats.get("token_budget", self.scheduler.max_num_batched_tokens)
-        phase = "prefill" if is_prefill else "decode"
-        if not seqs:
+        if not items:
             # 空批次契约：schedule() 在调度边界清理（超时/取消/终态兜底）后
             # 可能清空队列，或等待队列因 KV 不足暂不可执行。此时本轮无任何
             # 可执行请求，必须直接返回、不调用 ModelRunner（decode 组装
-            # block table 会崩溃），并记录 idle 执行事件说明原因
+            # block table 会崩溃），并记录 idle 执行事件说明原因。
+            # 事件字段按"事件类型"穷举（Day8 教训）：分阶段字段在 idle 轮补 0，
+            # 保证所有 engine_round 事件字段集合一致（验收脚本白名单校验）
             _log_event({
                 "event": "engine_round", "round_id": round_id, "phase": "idle",
                 "token_budget": budget, "planned_tokens": 0,
                 "executed_tokens": 0, "model_called": False, "outcome": "idle",
-                # 空轮无 prefill 批次：与 decode 轮同为 0，保持 engine_round
-                # 事件字段契约统一（验收脚本白名单要求所有 engine_round 均含该字段）
+                # 空轮无任何子批：各分阶段字段与 decode 轮同为 0，保持字段契约统一
                 "prefill_chunks": 0,
+                "prefill_items": 0, "decode_items": 0,
+                "prefill_tokens": 0, "decode_tokens": 0,
                 "observed_at": perf_counter(),
             })
             return [], 0
         # 调用前快照：postprocess 会把临时计数清零，不能在其后据此倒推执行工作量；
-        # 因此在模型调用前保存 (seq_id, request_id, n, offset, is_last_chunk)
-        # 与计划总量。offset/is_last_chunk 为 Day8 chunk 观测字段（仅 rank 0
-        # 统计用途，不进 TP payload）：is_last_chunk 标记该请求本轮 prefill
-        # 是否收尾（决定它是否产出采样 token），供日志关联与迟到结果核对
-        snapshot = [(seq.seq_id, seq.request_id, seq.num_scheduled_tokens,
-                     seq.prefill_offset,
-                     seq.prefill_offset + seq.num_scheduled_tokens == seq.prefill_target)
-                    for seq in seqs]
-        planned = sum(n for _, _, n, _, _ in snapshot)
-        # 调用前显式校验批次计数（不依赖会被 python -O 移除的 assert）：
-        # 非空批次每个计数必须为正，且总和不超过本轮 token 预算
-        if any(type(n) is not int or n <= 0 for _, _, n, _, _ in snapshot):
+        # 因此在模型调用前保存逐 item 的 _ItemSnapshot（字段说明见其 docstring）
+        snapshot = [_ItemSnapshot(it.seq.seq_id, it.seq.request_id, it.phase,
+                                  it.scheduled_tokens, it.offset_before,
+                                  it.is_last_chunk, it.round_id) for it in items]
+        prefill_item_count = sum(1 for s in snapshot if s.phase == "prefill")
+        prefill_tokens = sum(s.scheduled_tokens for s in snapshot
+                             if s.phase == "prefill")
+        decode_count = len(snapshot) - prefill_item_count
+        planned = prefill_tokens + decode_count
+        # 调用前显式校验批次（混合口径 §4.2，不依赖会被 python -O 移除的 assert）：
+        # 非空批次每个计数必须为正整数、phase 合法、decode 恒为 1、seq_id 不重复、
+        # 且"prefill token 总量 + decode 条数"不超过本轮 token 预算
+        if any(type(s.scheduled_tokens) is not int or s.scheduled_tokens <= 0
+               for s in snapshot):
             raise ValueError(
-                f"round {round_id}: 非空批次存在非正的 num_scheduled_tokens: {snapshot}")
+                f"round {round_id}: 非空批次存在非正的 scheduled_tokens: {snapshot}")
+        if any(s.phase not in ("prefill", "decode") for s in snapshot):
+            raise ValueError(
+                f"round {round_id}: 批次存在未知 phase 的 item: {snapshot}")
+        if any(s.scheduled_tokens != 1 for s in snapshot if s.phase == "decode"):
+            raise ValueError(
+                f"round {round_id}: decode item 的接纳数必须为 1: {snapshot}")
+        seq_ids = [s.seq_id for s in snapshot]
+        if len(set(seq_ids)) != len(seq_ids):
+            raise ValueError(f"round {round_id}: 批次内 seq_id 重复: {seq_ids}")
         if planned > budget:
             raise ValueError(
                 f"round {round_id}: 计划输入 token {planned} 超过预算 {budget}")
-        num_tokens = planned if is_prefill else -len(seqs)
+        # Day9 起工作量为本轮总 query token 数（恒非负），不再用符号编码阶段；
+        # 分阶段工作量见 engine_round 事件的 prefill_tokens/decode_tokens
+        num_tokens = planned
         try:
-            token_ids = self.model_runner.call("run", seqs, is_prefill)
+            token_ids = self.model_runner.call("run", items)
         except Exception:
             # 模型异常不假记成功执行：记录 error 与 planned_tokens，
             # executed_tokens=null（工作量未知）；异常继续向上传播。
@@ -137,26 +171,33 @@ class LLMEngine:
                 "event": "engine_round", "round_id": round_id, "phase": phase,
                 "token_budget": budget, "planned_tokens": planned,
                 "executed_tokens": None, "model_called": True, "outcome": "error",
-                "prefill_chunks": len(snapshot) if is_prefill else 0,
+                "prefill_chunks": prefill_item_count,
+                "prefill_items": prefill_item_count,
+                "decode_items": decode_count,
+                "prefill_tokens": prefill_tokens, "decode_tokens": decode_count,
                 "observed_at": perf_counter(),
             })
             raise
         # 正常返回：executed 取自调用前快照（模型实际输入 query token 数），
         # 即使 postprocess 因取消/超时丢弃采样输出，已执行输入仍计入本轮预算
-        executed = sum(n for _, _, n, _, _ in snapshot)
+        executed = planned
         _log_event({
             "event": "engine_round", "round_id": round_id, "phase": phase,
             "token_budget": budget, "planned_tokens": planned,
             "executed_tokens": executed, "model_called": True, "outcome": "completed",
-            # Day8：本轮 prefill 批次的 chunk 数（decode/idle 轮为 0）
-            "prefill_chunks": len(snapshot) if is_prefill else 0,
+            # Day8：本轮 prefill 子批的 chunk 数（decode/idle 轮为 0）；
+            # Day9：prefill_items 与 prefill_chunks 同值（同一口径的规范名与别名）
+            "prefill_chunks": prefill_item_count,
+            "prefill_items": prefill_item_count,
+            "decode_items": decode_count,
+            "prefill_tokens": prefill_tokens, "decode_tokens": decode_count,
             "observed_at": perf_counter(),
         })
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        self.scheduler.postprocess(items, token_ids)
         # 只把正常完成的请求当作 completion 汇报；
         # CANCELLED/TIMEOUT 请求由后续 API 层根据 finish_reason 决定响应
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs
-                   if seq.status == SequenceStatus.FINISHED]
+        outputs = [(it.seq.seq_id, it.seq.completion_token_ids) for it in items
+                   if it.seq.status == SequenceStatus.FINISHED]
         return outputs, num_tokens
 
     def is_finished(self):
@@ -199,10 +240,14 @@ class LLMEngine:
                     f"scheduler.cancel_request() 移除无法容纳的请求。活动请求: "
                     f"{[seq.request_id for seq in self.scheduler.requests.values()]}"
                 )
-            if num_tokens > 0:
-                prefill_throughput = num_tokens / (perf_counter() - t)
-            else:
-                decode_throughput = -num_tokens / (perf_counter() - t)
+            # Day9：吞吐按分阶段计划量计算（num_tokens 不再用符号编码阶段，
+            # 混合轮的 prefill/decode 工作量分别计入两个吞吐口径）
+            stats = self.scheduler.last_schedule_stats or {}
+            elapsed = perf_counter() - t
+            if stats.get("prefill_tokens"):
+                prefill_throughput = stats["prefill_tokens"] / elapsed
+            if stats.get("decode_tokens"):
+                decode_throughput = stats["decode_tokens"] / elapsed
             pbar.set_postfix({
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",

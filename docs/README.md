@@ -1,6 +1,6 @@
 # NanoServe 文档索引
 
-按 `plan.md` 的 20 天计划组织，当前覆盖 **Day 1–8**。本分支从 `dev=555ef43` 创建，并已合并 dev 集成 Day6 实现（提交 `c84e73f`）。Day7 已完成实现与验收，记录见 `day7-validation.md`；Day8 已在 `feature/chunked-prefill` 分支完成实现，验收记录见 `day8-validation.md`。
+按 `plan.md` 的 20 天计划组织，当前覆盖 **Day 1–9**（Day 9 已完成实现与验收，记录见 `day9-validation.md`）。本分支从 `dev=555ef43` 创建，并已合并 dev 集成 Day6 实现（提交 `c84e73f`）。Day7 已完成实现与验收，记录见 `day7-validation.md`；Day8 已在 `feature/chunked-prefill` 分支完成实现，验收记录见 `day8-validation.md`。
 
 ## 按天索引
 
@@ -26,6 +26,10 @@
 - [Day 8 验收记录](./day8-validation.md)：chunked prefill 实现范围、CPU 92 项新测试与全量 259 项回归、GPU 8K 三档分块/greedy 一致性/prefix 命中实测、greedy 数值差异分析与验收清单逐项核对；原始 JSONL 证据位于 `docs/evidence/day8/`。
 - [Day 8 实现审查](./day8-review.md)：对照设计复核 chunk 调度/KV 提交/采样契约与证据完整性；记录审查补强（idle 事件字段、脚本文案）、未闭环的 `runner_input_len` 条款与可读性建议。
 - [Day 8 Chunked Prefill 教程](./day8-tutorial.md)：面向推理引擎初学者的代码导读——从 Day7 隐式分块到显式进度、三个核心概念、扫描位置与队列分离、hash_blocks 显式区间、输入组装与采样契约、原子提交、GPU 一致性证据解读与思考题。
+- [Day 9 混合 Prefill 与 Decode 设计](./mixed-prefill-decode.md)：混合轮 `BatchItem` 逐请求阶段标注、decode-first 调度与混合预算公式、`decode_priority` 归因重构（不变量 18 的 `needed_first` 判定）、同轮分组执行与逐 item 提交契约、`1×8K + 32×128` 混合负载 benchmark 与验收方案。
+- [Day 9 实现审查](./day9-review.md)：对照设计复核混合调度/归因/采样与执行契约；记录 `warmup_model` 旧签名调用 `run()` 的 GPU 启动阻断缺陷（附修复建议）、`decode_priority` 判定与不变量 18 的偏差分析及可读性建议。
+- [Day 9 验收记录](./day9-validation.md)：审查问题修复（warmup 签名 P0、归因对齐不变量 18）、CPU 303 项回归、GPU 主负载 mixed vs one-shot 对照（短请求 TTFT P50 3.57s→0.20s、decode 7/7 轮持续产出、`runner_input_len` 对账收口）、greedy 26/33 差异分析与确定性复现；原始 JSONL 证据位于 `docs/evidence/day9/`。
+- [Day 9 混合 Prefill 与 Decode 教程](./day9-tutorial.md)：面向推理引擎初学者的代码导读——从"整批单阶段"的 decode 停滞到 decode-first 混合调度、`BatchItem` 逐请求标注、一轮两次前向的显式取舍、归因重构与 `needed_first` 规则、逐 item 提交与 round 关联、GPU 对照证据解读与思考题。
 
 ## 其他
 

@@ -26,6 +26,12 @@
 - 随机混合：固定 seed 交错 add/cancel/timeout/preempt/resume/旧结果，轮次上限
   防挂；最终队列/索引/ref/free-used 全平衡。
 
+Day9 适配说明（docs/mixed-prefill-decode.md）：schedule() 返回 (items, phase)、
+postprocess() 逐 item 提交；混合轮（如"已 RUNNING 请求 decode + waiting prefill
+续块"）取代部分旧纯 prefill 轮，相关断言按 (phase, seq_id) 序列改写；
+迟到 postprocess 新增 round_id 关联校验用例（同 seq 重新规划后旧批次拒绝）。
+纯单阶段场景（chunk 边界、prefix、输入组装、TP 协议）行为断言原样保持。
+
 无 GPU / 模型依赖：Scheduler/BlockManager/Sequence 为纯 CPU 逻辑；
 ModelRunner 通过 __new__ 绕过 GPU __init__，只调用 CPU 纯组装函数
 （_build_prefill_inputs/_build_decode_inputs/_select_prefill_sample_rows）；
@@ -100,21 +106,9 @@ def make_scheduler(num_blocks: int = 32, max_num_batched_tokens: int = 10 ** 6,
     return Scheduler(config)
 
 
-def needs_sample(seq: Sequence, is_prefill: bool) -> bool:
-    """与 Scheduler.postprocess 相同的需采样判定（调度快照口径）。"""
-    return (not is_prefill) or (
-        seq.prefill_offset + seq.num_scheduled_tokens == seq.prefill_target)
-
-
-def tokens_for_batch(batch: list[Sequence], is_prefill: bool, token: int) -> list[int]:
-    """按 Day8 提交契约构造 postprocess 的 token 注入列表。"""
-    return [token for s in batch if needs_sample(s, is_prefill)]
-
-
-def assert_round_invariants(sched: Scheduler, batch: list[Sequence], *,
-                            is_prefill: bool):
+def assert_round_invariants(sched: Scheduler, batch: list[Sequence]):
     """每轮硬约束：0<=planned<=B；len(batch)<=max_num_seqs；q_i 为正整数且
-    <= chunk_size；批次内 seq_id 不重复（每请求每轮至多一个 chunk）。"""
+    <= chunk_size；批次内 seq_id 不重复（每请求每轮至多一个 chunk/item）。"""
     stats = sched.last_schedule_stats
     planned = sum(s.num_scheduled_tokens for s in batch)
     assert stats["planned_tokens"] == planned
@@ -137,14 +131,13 @@ def drive_full_prefill(sched: Scheduler, seq: Sequence, token: int,
     intervals = []
     t = t0
     for _ in range(max_rounds):
-        batch, is_prefill = sched.schedule(now=t)
+        batch, items, is_prefill = schedule_round(sched, now=t)
         assert is_prefill, "prefill 完成前每轮都应是 prefill 批次"
-        assert_round_invariants(sched, batch, is_prefill=is_prefill)
+        assert_round_invariants(sched, batch)
         start = seq.prefill_offset
         q = seq.num_scheduled_tokens
         intervals.append((start, start + q))
-        sched.postprocess(batch, tokens_for_batch(batch, is_prefill, token),
-                          is_prefill, now=t)
+        sched.postprocess(items, tokens_for_items(items, token), now=t)
         t += 1.0
         if seq.status == RUNNING:
             break
@@ -162,6 +155,21 @@ def assert_intervals_contiguous(intervals: list[tuple[int, int]], target: int):
         assert end > start, "chunk 区间必须为正"
         pos = end
     assert pos == target, f"区间并集 {pos} != 有效上下文 {target}"
+
+
+def schedule_round(sched: Scheduler, *args, **kwargs):
+    """Day9 适配：schedule() 返回 (items, phase)；展开为 (seqs, items, is_prefill)。
+
+    items 是 Day9 postprocess 的入参（携带 needs_sample 快照与 round_id）；
+    is_prefill 仅服务旧断言（phase == "prefill"，decode/mixed 轮为 False）。
+    """
+    items, phase = sched.schedule(*args, **kwargs)
+    return [it.seq for it in items], items, phase == "prefill"
+
+
+def tokens_for_items(items, token: int) -> list[int]:
+    """按 Day9 提交契约构造 postprocess 的 token 注入列表（按 needs_sample 快照对齐）。"""
+    return [token for it in items if it.needs_sample]
 
 
 def decision_of(stats: dict, seq: Sequence) -> dict:
@@ -267,8 +275,8 @@ class TestSequenceProgressSemantics:
         sched = make_scheduler(num_blocks=4, max_num_batched_tokens=8, chunk_size=1024)
         seq = make_seq(20, max_tokens=2)
         sched.add(seq)
-        batch, is_prefill = sched.schedule(now=1.0)
-        sched.postprocess(batch, [], is_prefill, now=1.0)
+        batch, items, is_prefill = schedule_round(sched, now=1.0)
+        sched.postprocess(items, [], now=1.0)
         assert seq.prefill_offset == 8
         assert seq.num_cached_tokens == 8  # 兼容视图同步
         assert seq.prefill_complete is False
@@ -364,7 +372,7 @@ class TestBudgetInteraction:
         a, b = make_seq(20, max_tokens=2), make_seq(4, max_tokens=2)
         sched.add(a)
         sched.add(b)
-        batch, is_prefill = sched.schedule(now=1.0)
+        batch, items, is_prefill = schedule_round(sched, now=1.0)
         assert is_prefill
         assert [s.seq_id for s in batch] == [a.seq_id, b.seq_id]
         assert a.num_scheduled_tokens == 8       # 受 chunk_size 限制（而非预算 32）
@@ -399,14 +407,14 @@ class TestBudgetInteraction:
         seq = make_seq(20, max_tokens=2)
         sched.add(seq)
         for t in (1.0, 2.0, 3.0, 4.0, 5.0):
-            batch, is_prefill = sched.schedule(now=t)
+            batch, items, is_prefill = schedule_round(sched, now=t)
             assert is_prefill
-            assert_round_invariants(sched, batch, is_prefill=is_prefill)
+            assert_round_invariants(sched, batch)
             # 每轮部分推进都属于被调度，不是 budget 等待
             assert sched.last_schedule_stats["budget_deferred_requests"] == 0
             assert decision_of(sched.last_schedule_stats, seq)["reason"] == "scheduled"
-            sched.postprocess(batch, tokens_for_batch(batch, is_prefill, 7),
-                              is_prefill, now=t)
+            sched.postprocess(items, tokens_for_items(items, 7),
+                              now=t)
             if seq.status == RUNNING:
                 break
         assert seq.prefill_offset == 20
@@ -418,7 +426,7 @@ class TestBudgetInteraction:
         a, b, c = make_seq(3, 8), make_seq(5, 8), make_seq(2, 8)
         for s in (a, b, c):
             sched.add(s)
-        batch, is_prefill = sched.schedule(now=1.0)
+        batch, items, is_prefill = schedule_round(sched, now=1.0)
         assert is_prefill and [s.seq_id for s in batch] == [a.seq_id, b.seq_id]
         dc = decision_of(sched.last_schedule_stats, c)
         assert dc["reason"] == "budget"
@@ -432,10 +440,10 @@ class TestBudgetInteraction:
                                max_num_seqs=4, chunk_size=5)
         for _ in range(60):
             sched.add(make_seq(rng.randint(1, 20), max_tokens=rng.randint(1, 3)))
-            batch, is_prefill = sched.schedule(now=1.0)
-            assert_round_invariants(sched, batch, is_prefill=is_prefill)
-            sched.postprocess(batch, tokens_for_batch(batch, is_prefill, 7),
-                              is_prefill, now=1.0)
+            batch, items, is_prefill = schedule_round(sched, now=1.0)
+            assert_round_invariants(sched, batch)
+            sched.postprocess(items, tokens_for_items(items, 7),
+                              now=1.0)
         for sid in list(sched.requests):
             sched.cancel(sid, now=2.0)
         assert sched.is_finished()
@@ -451,7 +459,7 @@ class TestSchedulingRules:
         sched = make_scheduler(num_blocks=8, max_num_batched_tokens=64, chunk_size=8)
         seq = make_seq(20, max_tokens=2)
         sched.add(seq)
-        batch, is_prefill = sched.schedule(now=1.0)
+        batch, items, is_prefill = schedule_round(sched, now=1.0)
         assert is_prefill
         assert [s.seq_id for s in batch].count(seq.seq_id) == 1
         assert seq.num_scheduled_tokens == 8
@@ -466,7 +474,7 @@ class TestSchedulingRules:
         a, b, c = make_seq(20, 2), make_seq(6, 2), make_seq(5, 2)
         for s in (a, b, c):
             sched.add(s)
-        batch, is_prefill = sched.schedule(now=1.0)
+        batch, items, is_prefill = schedule_round(sched, now=1.0)
         assert is_prefill
         # a 首候选拆分；b、c 整段放下，同轮接纳并完成各自 prefill
         assert [s.seq_id for s in batch] == [a.seq_id, b.seq_id, c.seq_id]
@@ -481,7 +489,7 @@ class TestSchedulingRules:
         a, b, c = make_seq(20, 2), make_seq(30, 2), make_seq(2, 2)
         for s in (s_ for s_ in (a, b, c)):
             sched.add(s)
-        batch, is_prefill = sched.schedule(now=1.0)
+        batch, items, is_prefill = schedule_round(sched, now=1.0)
         assert is_prefill
         assert [s.seq_id for s in batch] == [a.seq_id]  # b 放不下即停，c 不被跳过接纳
         db = decision_of(sched.last_schedule_stats, b)
@@ -499,7 +507,7 @@ class TestSchedulingRules:
         a, b = make_seq(20, 2), make_seq(10, 2)
         sched.add(a)
         sched.add(b)
-        batch, _ = sched.schedule(now=1.0)
+        batch, items, _ = schedule_round(sched, now=1.0)
         assert [s.seq_id for s in batch] == [a.seq_id]  # a 接纳 8，余 4 < b 需求 10
         db = decision_of(sched.last_schedule_stats, b)
         assert db["reason"] == "budget"
@@ -511,15 +519,16 @@ class TestSchedulingRules:
         a, b = make_seq(20, 2), make_seq(4, 2)
         sched.add(a)
         sched.add(b)
-        batch, _ = sched.schedule(now=1.0)
-        sched.postprocess(batch, tokens_for_batch(batch, True, 7), True, now=1.0)
-        # b 已在上一轮完成 prefill；本轮 a 仍是队首
-        batch, is_prefill = sched.schedule(now=2.0)
-        assert is_prefill
-        assert [s.seq_id for s in batch] == [a.seq_id]
+        batch, items, _ = schedule_round(sched, now=1.0)
+        sched.postprocess(items, tokens_for_items(items, 7), now=1.0)
+        # b 已在上一轮完成 prefill；本轮 decode-first 先推进 b，再续传 a 的 chunk 2
+        batch, items, is_prefill = schedule_round(sched, now=2.0)
+        assert [(it.phase, it.seq.seq_id) for it in items] == [
+            ("decode", b.seq_id), ("prefill", a.seq_id)]
         assert a.num_scheduled_tokens == 8
         da = decision_of(sched.last_schedule_stats, a)
         assert da["chunk_index"] == 2 and da["offset_before"] == 8
+        sched.postprocess(items, tokens_for_items(items, 7), now=2.0)
 
     def test_chunk_index_counts_per_phase_and_resets_after_resume(self):
         """chunk_index 按 prefill 阶段计数：恢复重算后从 1 重新开始。"""
@@ -528,20 +537,20 @@ class TestSchedulingRules:
         sched.add(seq)
         indices = []
         for t in range(1, 8):
-            batch, is_prefill = sched.schedule(now=float(t))
+            batch, items, is_prefill = schedule_round(sched, now=float(t))
             if not is_prefill:
                 break
             d = decision_of(sched.last_schedule_stats, seq)
             indices.append(d["chunk_index"])
-            sched.postprocess(batch, tokens_for_batch(batch, is_prefill, 7),
-                              is_prefill, now=float(t))
+            sched.postprocess(items, tokens_for_items(items, 7),
+                              now=float(t))
         assert indices == [1, 2, 3]  # 8/8/4 三个 chunk
         # decode 一轮后抢占再恢复：重算属于新 prefill 阶段
-        batch, _ = sched.schedule(now=10.0)
-        sched.postprocess(batch, [7] * len(batch), False, now=10.0)
+        batch, items, _ = schedule_round(sched, now=10.0)
+        sched.postprocess(items, tokens_for_items(items, 7), now=10.0)
         sched.preempt(seq, now=11.0)
         sched.resume(seq)
-        batch, is_prefill = sched.schedule(now=12.0)
+        batch, items, is_prefill = schedule_round(sched, now=12.0)
         assert is_prefill
         d = decision_of(sched.last_schedule_stats, seq)
         assert d["chunk_index"] == 1
@@ -554,7 +563,7 @@ class TestSchedulingRules:
         a, b, c = make_seq(4, 2), make_seq(4, 2), make_seq(4, 2)
         for s in (a, b, c):
             sched.add(s)
-        batch, _ = sched.schedule(now=1.0)
+        batch, items, _ = schedule_round(sched, now=1.0)
         assert [s.seq_id for s in batch] == [a.seq_id, b.seq_id]
         assert decision_of(sched.last_schedule_stats, c)["reason"] == "sequence_cap"
 
@@ -727,17 +736,20 @@ class TestPrefixAndRecompute:
         prompt = list(range(1, 17))                     # 16 token = 2 完整块
         a = Sequence(prompt, SamplingParams(max_tokens=2, ignore_eos=True))
         sched.add(a)
-        batch, _ = sched.schedule(now=1.0)
-        sched.postprocess(batch, [7], True, now=1.0)
+        batch, items, _ = schedule_round(sched, now=1.0)
+        sched.postprocess(items, [7], now=1.0)
         b = Sequence(prompt + [91, 92], SamplingParams(max_tokens=2, ignore_eos=True))
         sched.add(b)
-        batch, is_prefill = sched.schedule(now=2.0)
-        assert is_prefill
+        # Day9：a 已 RUNNING，本轮 decode-first 先推进 a 的 decode，再接纳 b 的 prefill
+        batch, items, is_prefill = schedule_round(sched, now=2.0)
+        assert [(it.phase, it.seq.seq_id) for it in items] == [
+            ("decode", a.seq_id), ("prefill", b.seq_id)]
         # 尾块（第 3 块）永不命中：初始 offset = 2 块 * 8 = 16
         assert b.prefill_offset == 16
         assert b.num_scheduled_tokens == 2              # 只执行 [16, 18)
         d = decision_of(sched.last_schedule_stats, b)
         assert d["offset_before"] == 16 and d["is_last_chunk"] is True
+        sched.postprocess(items, tokens_for_items(items, 7), now=2.0)
 
     def test_tail_block_never_hit(self):
         """can_allocate 协议：range(num_blocks-1)，最后一块永不假命中。"""
@@ -745,8 +757,8 @@ class TestPrefixAndRecompute:
         prompt = list(range(1, 17))                     # 恰好 2 个完整块
         a = Sequence(prompt, SamplingParams(max_tokens=1, ignore_eos=True))
         sched.add(a)
-        batch, _ = sched.schedule(now=1.0)
-        sched.postprocess(batch, [7], True, now=1.0)    # 2 块全部登记
+        batch, items, _ = schedule_round(sched, now=1.0)
+        sched.postprocess(items, [7], now=1.0)    # 2 块全部登记
         b = Sequence(prompt, SamplingParams(max_tokens=1, ignore_eos=True))
         sched.add(b)
         sched.schedule(now=2.0)
@@ -759,8 +771,8 @@ class TestPrefixAndRecompute:
         sched = make_scheduler(num_blocks=8, max_num_batched_tokens=12, chunk_size=1024)
         seq = make_seq(20, max_tokens=2)
         sched.add(seq)
-        batch, _ = sched.schedule(now=1.0)              # chunk [0, 12)
-        sched.postprocess(batch, [], True, now=1.0)
+        batch, items, _ = schedule_round(sched, now=1.0)              # chunk [0, 12)
+        sched.postprocess(items, [], now=1.0)
         bm = sched.block_manager
         # 块 0 已被本次执行写满并登记；块 1（部分写入）不登记
         h0 = BlockManager.compute_hash(seq.block(0), -1)
@@ -771,7 +783,7 @@ class TestPrefixAndRecompute:
         follower = Sequence(seq.token_ids[:8] + [71, 72, 73, 74],
                             SamplingParams(max_tokens=1, ignore_eos=True))
         sched.add(follower)
-        batch, is_prefill = sched.schedule(now=2.0)
+        batch, items, is_prefill = schedule_round(sched, now=2.0)
         assert is_prefill
         assert follower.prefill_offset == 8
         assert follower.block_table[0] == seq.block_table[0]
@@ -796,23 +808,23 @@ class TestPrefixAndRecompute:
         sched = make_scheduler(num_blocks=8, max_num_batched_tokens=64, chunk_size=1024)
         seq = make_seq(16, max_tokens=8)
         sched.add(seq)
-        batch, _ = sched.schedule(now=1.0)              # prefill 16
-        sched.postprocess(batch, [7], True, now=1.0)    # len=17, offset=16
-        batch, is_prefill = sched.schedule(now=2.0)
+        batch, items, _ = schedule_round(sched, now=1.0)              # prefill 16
+        sched.postprocess(items, [7], now=1.0)    # len=17, offset=16
+        batch, items, is_prefill = schedule_round(sched, now=2.0)
         assert not is_prefill
-        sched.postprocess(batch, [8], False, now=2.0)   # len=18, offset=17
+        sched.postprocess(items, [8], now=2.0)   # len=18, offset=17
         sched.preempt(seq, now=3.0)
         assert seq.prefill_offset == 0                  # 进度随物理块作废
         assert seq.block_table == []
         sched.resume(seq)
-        batch, is_prefill = sched.schedule(now=4.0)
+        batch, items, is_prefill = schedule_round(sched, now=4.0)
         assert is_prefill
         # 重算区间 [16, 18)：前 2 块命中自身缓存（16 token），重算需求 2
         assert seq.prefill_offset == 16
         assert seq.num_scheduled_tokens == 2
         d = decision_of(sched.last_schedule_stats, seq)
         assert d["offset_before"] == 16 and d["is_last_chunk"] is True
-        sched.postprocess(batch, [9], True, now=4.0)
+        sched.postprocess(items, [9], now=4.0)
         assert seq.status == RUNNING
         assert seq.prefill_offset == 18
         assert seq.token_ids[-3:] == [7, 8, 9]          # 生成进度未丢失
@@ -879,11 +891,11 @@ class TestSamplingContract:
         sched = make_scheduler(num_blocks=4, max_num_batched_tokens=8, chunk_size=1024)
         seq = make_seq(20, max_tokens=2)
         sched.add(seq)
-        batch, is_prefill = sched.schedule(now=1.0)
+        batch, items, is_prefill = schedule_round(sched, now=1.0)
         with pytest.raises(ValueError, match="需采样请求数"):
-            sched.postprocess(batch, [7], is_prefill, now=1.0)
+            sched.postprocess(items, [7], now=1.0)
         # 正确注入（空列表）后 offset 正常推进
-        sched.postprocess(batch, [], is_prefill, now=1.0)
+        sched.postprocess(items, [], now=1.0)
         assert seq.prefill_offset == 8 and len(seq.token_ids) == 20
 
     def test_last_chunk_missing_token_rejected(self):
@@ -891,20 +903,20 @@ class TestSamplingContract:
         sched = make_scheduler(num_blocks=4, max_num_batched_tokens=32, chunk_size=1024)
         seq = make_seq(8, max_tokens=2)
         sched.add(seq)
-        batch, is_prefill = sched.schedule(now=1.0)
+        batch, items, is_prefill = schedule_round(sched, now=1.0)
         with pytest.raises(ValueError, match="需采样请求数"):
-            sched.postprocess(batch, [], is_prefill, now=1.0)
+            sched.postprocess(items, [], now=1.0)
 
     def test_decode_missing_token_rejected(self):
         sched = make_scheduler(num_blocks=4, max_num_batched_tokens=32, chunk_size=1024)
         seq = make_seq(4, max_tokens=2)
         sched.add(seq)
-        batch, _ = sched.schedule(now=1.0)
-        sched.postprocess(batch, [7], True, now=1.0)
-        batch, is_prefill = sched.schedule(now=2.0)
+        batch, items, _ = schedule_round(sched, now=1.0)
+        sched.postprocess(items, [7], now=1.0)
+        batch, items, is_prefill = schedule_round(sched, now=2.0)
         assert not is_prefill
         with pytest.raises(ValueError, match="需采样请求数"):
-            sched.postprocess(batch, [], is_prefill, now=2.0)
+            sched.postprocess(items, [], now=2.0)
 
     def test_mixed_batch_token_alignment(self):
         """混合批次：token 按需采样集合对齐（A 中间无 token，B/C 各得一 token）。"""
@@ -912,10 +924,10 @@ class TestSamplingContract:
         a, b, c = make_seq(20, 2), make_seq(6, 2), make_seq(5, 2)
         for s in (a, b, c):
             sched.add(s)
-        batch, is_prefill = sched.schedule(now=1.0)
+        batch, items, is_prefill = schedule_round(sched, now=1.0)
         assert [s.seq_id for s in batch] == [a.seq_id, b.seq_id, c.seq_id]
         # a 中间 chunk 无 token；b、c 最后 chunk 各一 token
-        sched.postprocess(batch, [201, 202], is_prefill, now=1.0)
+        sched.postprocess(items, [201, 202], now=1.0)
         assert a.token_ids == a.prompt_token_ids        # a 未追加
         assert b.token_ids[-1] == 201
         assert c.token_ids[-1] == 202
@@ -929,8 +941,8 @@ class TestLifecycleDuringChunks:
     def _chunking_seq(self, sched: Scheduler) -> Sequence:
         seq = make_seq(20, max_tokens=4)
         sched.add(seq)
-        batch, is_prefill = sched.schedule(now=1.0)
-        sched.postprocess(batch, [], is_prefill, now=1.0)   # offset=8，仍 WAITING
+        batch, items, is_prefill = schedule_round(sched, now=1.0)
+        sched.postprocess(items, [], now=1.0)   # offset=8，仍 WAITING
         return seq
 
     def test_cancel_mid_chunk(self):
@@ -949,14 +961,14 @@ class TestLifecycleDuringChunks:
         sched = make_scheduler(num_blocks=4, max_num_batched_tokens=8, chunk_size=1024)
         seq = make_seq(20, max_tokens=4, deadline=5.0)
         sched.add(seq)
-        batch, is_prefill = sched.schedule(now=1.0)
-        sched.postprocess(batch, [], is_prefill, now=1.0)
+        batch, items, is_prefill = schedule_round(sched, now=1.0)
+        sched.postprocess(items, [], now=1.0)
         assert seq.prefill_offset == 8                  # 第 1 chunk 已提交
-        batch, is_prefill = sched.schedule(now=2.0)     # 第 2 chunk 接纳
+        batch, items, is_prefill = schedule_round(sched, now=2.0)     # 第 2 chunk 接纳
         assert is_prefill
         # 执行返回时已跨过 deadline：该 chunk 不提交，按 TIMEOUT 终止；
         # 终态清理释放 KV 后进度随之作废（offset 归零）
-        sched.postprocess(batch, [], is_prefill, now=6.0)
+        sched.postprocess(items, [], now=6.0)
         assert seq.status == TIMEOUT
         assert seq.prefill_offset == 0
         assert seq.block_table == []
@@ -967,38 +979,50 @@ class TestLifecycleDuringChunks:
         sched = make_scheduler(num_blocks=4, max_num_batched_tokens=8, chunk_size=1024)
         seq = self._chunking_seq(sched)
         seq.mark_cancelled("client_abort")
-        batch, is_prefill = sched.schedule(now=2.0)     # 边界兜底清理后空批
+        batch, items, is_prefill = schedule_round(sched, now=2.0)     # 边界兜底清理后空批
         assert batch == []
         assert sched.is_finished()
 
     def test_duplicate_postprocess_rejected(self):
-        """重复 postprocess（计数已清零）被快照校验拒绝，进度不二次推进。"""
-        sched = make_scheduler(num_blocks=4, max_num_batched_tokens=8, chunk_size=1024)
-        seq = self._chunking_seq(sched)
-        with pytest.raises(ValueError, match="重复或迟到的 postprocess"):
-            sched.postprocess([seq], [], True, now=2.0)
-        assert seq.prefill_offset == 8
-
-    def test_stale_live_batch_rejected(self):
-        """迟到旧批次重放（请求已无待执行计划）被拒绝，进度不二次推进。"""
+        """重复 postprocess（同轮计划已清零）被快照校验拒绝，进度不二次推进。"""
         sched = make_scheduler(num_blocks=4, max_num_batched_tokens=8, chunk_size=1024)
         seq = make_seq(20, max_tokens=4)
         sched.add(seq)
-        batch, _ = sched.schedule(now=1.0)
-        sched.postprocess(batch, [], True, now=1.0)     # 第 1 chunk 已提交
+        batch, items, _ = schedule_round(sched, now=1.0)
+        sched.postprocess(items, [], now=1.0)     # 第 1 chunk 已提交，计划清零
         with pytest.raises(ValueError, match="重复或迟到的 postprocess"):
-            sched.postprocess(batch, [], True, now=2.0)
+            sched.postprocess(items, [], now=2.0)  # 同轮重放：无待执行计划
         assert seq.prefill_offset == 8
+
+    def test_stale_live_batch_rejected(self):
+        """迟到旧批次重放（同 seq 已被重新规划）被 round_id 关联校验拒绝（Day9 加固）。
+
+        Day8 遗留（day8-review §4.4）：旧实现仅靠"计划已清零"检测，若两次收尾
+        之间同 seq 已被重新接纳，旧批次会以新计划二次提交。Day9 起 items 携带
+        round_id，含活动请求的批次与最近调度轮不匹配即显式拒绝。
+        """
+        sched = make_scheduler(num_blocks=4, max_num_batched_tokens=8, chunk_size=1024)
+        seq = make_seq(20, max_tokens=4)
+        sched.add(seq)
+        batch, stale_items, _ = schedule_round(sched, now=1.0)
+        sched.postprocess(stale_items, [], now=1.0)   # 第 1 chunk 已提交
+        batch2, items2, _ = schedule_round(sched, now=2.0)   # 同 seq 被重新规划
+        assert any(it.seq is seq for it in items2)
+        with pytest.raises(ValueError, match="迟到"):
+            sched.postprocess(stale_items, [], now=2.0)  # 旧 round 的批次重放
+        # 新计划不受影响：正常提交推进
+        sched.postprocess(items2, [], now=2.0)
+        assert seq.prefill_offset == 16
 
     def test_failure_does_not_advance_offset(self):
         """失败不提交：安全检查命中（执行期间取消）时该 chunk 的进度不推进。"""
         sched = make_scheduler(num_blocks=4, max_num_batched_tokens=8, chunk_size=1024)
         seq = make_seq(20, max_tokens=4)
         sched.add(seq)
-        batch, is_prefill = sched.schedule(now=1.0)
+        batch, items, is_prefill = schedule_round(sched, now=1.0)
         seq.request_cancel("mid_exec")                  # 模拟执行期间取消
-        sched.postprocess(batch, tokens_for_batch(batch, is_prefill, 7),
-                          is_prefill, now=1.0)
+        sched.postprocess(items, tokens_for_items(items, 7),
+                          now=1.0)
         assert seq.status == CANCELLED
         assert seq.prefill_offset == 0                  # 未提交
         assert sched.block_manager.used_block_ids == set()  # KV 已释放
@@ -1047,10 +1071,10 @@ class TestOneShotVsChunkedConsistency:
         for _ in range(500):
             if sched.is_finished():
                 return outputs
-            batch, is_prefill = sched.schedule(now=t)
-            assert_round_invariants(sched, batch, is_prefill=is_prefill)
-            tokens = [token_fn(s) for s in batch if needs_sample(s, is_prefill)]
-            sched.postprocess(batch, tokens, is_prefill, now=t)
+            batch, items, is_prefill = schedule_round(sched, now=t)
+            assert_round_invariants(sched, batch)
+            tokens = [token_fn(it.seq) for it in items if it.needs_sample]
+            sched.postprocess(items, tokens, now=t)
             for s in batch:
                 if s.status == FINISHED:
                     outputs[s.request_id] = s.completion_token_ids
@@ -1065,10 +1089,10 @@ class TestOneShotVsChunkedConsistency:
         rounds = 0
         t = 1.0
         while seq.status == WAITING:
-            batch, is_prefill = sched.schedule(now=t)
+            batch, items, is_prefill = schedule_round(sched, now=t)
             assert is_prefill
-            sched.postprocess(batch, tokens_for_batch(batch, is_prefill, 7),
-                              is_prefill, now=t)
+            sched.postprocess(items, tokens_for_items(items, 7),
+                              now=t)
             rounds += 1
             t += 1.0
             assert rounds < 10
@@ -1182,16 +1206,14 @@ class TestEngineChunkObservation:
             encode=lambda text: [ord(c) % 100 + 1 for c in text])
         calls = []
 
-        def fake_call(method, seqs, is_prefill):
-            calls.append(([(s.seq_id, s.request_id, s.num_scheduled_tokens,
-                            s.prefill_offset,
-                            s.prefill_offset + s.num_scheduled_tokens == s.prefill_target)
-                           for s in seqs], is_prefill))
-            if not is_prefill:
-                return [7] * len(seqs)
-            n = sum(1 for s in seqs
-                    if s.prefill_offset + s.num_scheduled_tokens == s.prefill_target)
-            return [7] * n if n else None
+        def fake_call(method, items_):
+            # Day9 契约 runner：按 item 顺序返回 decode + 最后 chunk 的采样 token；
+            # 调用时快照 (seq_id, request_id, phase, n, offset, is_last_chunk)
+            calls.append([(it.seq.seq_id, it.seq.request_id, it.phase,
+                           it.scheduled_tokens, it.offset_before, it.is_last_chunk)
+                          for it in items_])
+            out = tokens_for_items(items_, 7)
+            return out if out else None
 
         engine.model_runner = SimpleNamespace(call=fake_call)
         return engine, calls
@@ -1212,11 +1234,15 @@ class TestEngineChunkObservation:
         # 请求完成（max_tokens=2）后从活动索引移除
         assert sched.is_finished()
         assert num_tokens_list[0] == 8                  # 首 chunk 8 token
-        # 快照校验：每个 prefill 轮恰好一个 chunk，offset 单调推进、末轮收尾
-        prefill_calls = [snap for snap, pre in calls if pre]
-        assert [snap[0][3] for snap in prefill_calls] == [0, 8, 16]     # offset_before
-        assert [snap[0][2] for snap in prefill_calls] == [8, 8, 4]      # q
-        assert [snap[0][4] for snap in prefill_calls] == [False, False, True]
+        # 快照校验：单请求场景每轮只含一个 item；prefill 轮 offset 单调推进、
+        # 末轮收尾（decode 轮的快照按 phase 字段过滤掉）
+        prefill_calls = [snap for snap in calls if snap[0][2] == "prefill"]
+        assert len(prefill_calls) == 3
+        assert [snap[0][4] for snap in prefill_calls] == [0, 8, 16]     # offset_before
+        assert [snap[0][3] for snap in prefill_calls] == [8, 8, 4]      # q
+        assert [snap[0][5] for snap in prefill_calls] == [False, False, True]
+        decode_calls = [snap for snap in calls if snap[0][2] == "decode"]
+        assert decode_calls and all(snap[0][3] == 1 for snap in decode_calls)
         # 事件：engine_round 含 prefill_chunks（prefill 轮=1，decode 轮=0）
         events = [json.loads(r.message) for r in caplog.records
                   if r.message.startswith("{")]
@@ -1255,7 +1281,7 @@ class TestEngineChunkObservation:
         engine.tokenizer = SimpleNamespace(
             encode=lambda text: [ord(c) % 100 + 1 for c in text])
         engine.model_runner = SimpleNamespace(
-            call=lambda m, seqs, pre: [7] * len(seqs))   # 违反契约：总是返回 token
+            call=lambda m, items_: [7])   # 违反契约：无采样轮也返回 token
         engine.add_request("x" * 20, SamplingParams(max_tokens=2, ignore_eos=True))
         with pytest.raises(ValueError, match="需采样请求数"):
             engine.step()
@@ -1265,9 +1291,9 @@ class TestEngineChunkObservation:
         sched = make_scheduler(num_blocks=8, max_num_batched_tokens=8, chunk_size=1024)
         seq = make_seq(20, max_tokens=2)
         sched.add(seq)
-        batch, is_prefill = sched.schedule(now=1.0)
+        batch, items, is_prefill = schedule_round(sched, now=1.0)
         assert is_prefill and batch == [seq]
-        sched.postprocess(batch, None, is_prefill, now=1.0)
+        sched.postprocess(items, None, now=1.0)
         assert seq.prefill_offset == 8
         assert seq.num_scheduled_tokens == 0
         assert seq.status == WAITING
@@ -1310,17 +1336,19 @@ class TestMixedRandomChunked:
                     # 只有 RUNNING 可正常完成（WAITING -> FINISHED 非法迁移）
                     victim.mark_finished("stop")
             elif op < 0.60 and stale_batches:
-                seqs, is_pre, tokens = stale_batches.pop(
+                stale_items, tokens = stale_batches.pop(
                     rng.randrange(len(stale_batches)))
-                if all(s.is_terminal for s in seqs):
-                    sched.postprocess(seqs, tokens, is_pre, now=now)
+                if all(it.seq.is_terminal for it in stale_items):
+                    # 迟到重放：只允许全终态批次（模拟迟到的执行结果；
+                    # 全终态重放受 round 校验豁免，是安全空操作）
+                    sched.postprocess(stale_items, tokens, now=now)
             # 驱动一轮
-            batch, is_prefill = sched.schedule(now=now)
-            assert_round_invariants(sched, batch, is_prefill=is_prefill)
-            tokens = [rng.randint(1, 100) for s in batch if needs_sample(s, is_prefill)]
-            sched.postprocess(batch, tokens, is_prefill, now=now)
-            if batch:
-                stale_batches.append((list(batch), is_prefill, tokens))
+            batch, items, is_prefill = schedule_round(sched, now=now)
+            assert_round_invariants(sched, batch)
+            tokens = [rng.randint(1, 100) for it in items if it.needs_sample]
+            sched.postprocess(items, tokens, now=now)
+            if items:
+                stale_batches.append((items, tokens))
                 if len(stale_batches) > 4:
                     stale_batches.pop(0)
             # 轻量不变量：队列互斥、状态与索引一致、chunk 进度单调有界
@@ -1361,10 +1389,10 @@ class TestMixedRandomChunked:
                     sched.add(make_seq(rng.randint(1, 14), max_tokens=rng.randint(1, 3)))
                 except ValueError:
                     pass
-            batch, is_prefill = sched.schedule(now=now)
-            assert_round_invariants(sched, batch, is_prefill=is_prefill)
-            sched.postprocess(batch, tokens_for_batch(batch, is_prefill, 7),
-                              is_prefill, now=now)
+            batch, items, is_prefill = schedule_round(sched, now=now)
+            assert_round_invariants(sched, batch)
+            sched.postprocess(items, tokens_for_items(items, 7),
+                              now=now)
         for sid in list(sched.requests):
             sched.cancel(sid, now=now)
         assert sched.is_finished()

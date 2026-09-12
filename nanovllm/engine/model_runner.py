@@ -5,6 +5,7 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
+from nanovllm.engine.scheduler import BatchItem
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -98,7 +99,16 @@ class ModelRunner:
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
+        # Day9 签名适配：run() 消费 BatchItem 列表。warmup 语义与 Day8 逐位一致：
+        # prefill_offset=0、num_scheduled_tokens=seq_len、prefill_target=seq_len，
+        # 每条序列都是"最后 chunk"（谓词成立，全部行采样）。warmup 不经过
+        # Scheduler/postprocess，round_id=0 仅作占位（不会被消费）。
+        items = [BatchItem(seq=seq, phase="prefill",
+                           scheduled_tokens=seq.num_scheduled_tokens,
+                           offset_before=0, is_last_chunk=True,
+                           needs_sample=True, round_id=0)
+                 for seq in seqs]
+        self.run(items)
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -275,58 +285,91 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool):
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        logits = self.run_model(input_ids, positions, is_prefill)
+    def run(self, items: list):
+        """Day9 混合轮执行：同一调度轮内按 phase 分组，先 decode 子批后 prefill 子批。
+
+        §2.2 设计决策（不实现单次 fused mixed attention）：Context/Attention/
+        ParallelLMHead 仍按单阶段批次消费——两个子批各自构造输入、执行前向并
+        reset_context，互不残留 Context 状态；decode 子批沿用既有 CUDA Graph
+        路径（enforce_eager=False 且 bs<=512 时）。
+
+        采样结果合并契约（§4.1）：items 有序（decode 在前、prefill 在后），
+        返回的 token 列表 = decode 子批采样结果 + prefill 最后 chunk 采样结果，
+        与 items 中 needs_sample 的出现顺序一致——postprocess 按同一顺序消费，
+        两端共享同一对齐契约，任何一端不得隐式重排。
+        整轮无任何采样 item 时返回 None（沿用 Day8"无采样返回 None"契约）。
+        TP>1：所有 rank 都要执行两个子批的前向（KV 写入必须全 rank 一致），
+        仅采样与 logits 消费限定 rank 0。
+        """
+        token_ids: list[int] = []
+        decode_items = [it for it in items if it.phase == "decode"]
+        prefill_items = [it for it in items if it.phase == "prefill"]
+        if len(decode_items) + len(prefill_items) != len(items):
+            unknown = {it.phase for it in items} - {"prefill", "decode"}
+            raise ValueError(f"批次存在未知 phase 的 item: {sorted(unknown)}")
+        # ---------- decode 子批（在前）：last_token 单步前向 ----------
+        if decode_items:
+            seqs = [it.seq for it in decode_items]
+            input_ids, positions = self.prepare_decode(seqs)
+            logits = self.run_model(input_ids, positions, False)
+            if self.rank == 0:
+                temperatures, top_ps, generators = self.prepare_sample(seqs)
+                token_ids.extend(
+                    self.sampler(logits, temperatures, top_ps, generators).tolist())
+            reset_context()
+        # ---------- prefill 子批（在后）：显式 offset 契约组装 ----------
+        if prefill_items:
+            seqs = [it.seq for it in prefill_items]
+            input_ids, positions = self.prepare_prefill(seqs)
+            logits = self.run_model(input_ids, positions, True)
+            if self.rank == 0:
+                # ---------- prefill 采样契约（Day8 沿用） ----------
+                # 1) 行选择：ParallelLMHead 在 prefill 分支已按 cu_seqlens_q[1:]-1
+                #    把每个请求的"最后一个 query 行"聚合为 [len(seqs), vocab]；
+                #    显式校验行数与请求一一对应，形状错位不再静默。
+                # 2) 中间 chunk 不采样、不消耗 RNG：torch.multinomial 会推进
+                #    generator 状态，若中间 chunk 也采样，chunk 划分不同就会改变
+                #    RNG 流，"chunked 与 one-shot 输出一致"在随机采样下不可达。
+                #    因此只有最后 chunk 才进入采样。
+                # 3) 行选择以 BatchItem.needs_sample（调度冻结快照）为准，并与
+                #    Sequence 具名谓词交叉校验——两者同源，不一致说明调度与执行
+                #    之间请求状态被破坏，尽早显式失败。
+                if logits.shape[0] != len(seqs):
+                    raise ValueError(
+                        f"prefill logits 行数 {logits.shape[0]} 与请求数 {len(seqs)} 不一致，"
+                        "每请求应恰好聚合出其最后 query 行")
+                sample_idx = [i for i, it in enumerate(prefill_items) if it.needs_sample]
+                predicate_idx = self._select_prefill_sample_rows(seqs)
+                if sample_idx != predicate_idx:
+                    raise ValueError(
+                        f"BatchItem.needs_sample 快照 {sample_idx} 与执行侧谓词 "
+                        f"{predicate_idx} 不一致，调度与执行之间的请求状态被破坏")
+                if sample_idx:
+                    temperatures, top_ps, generators = self.prepare_sample(seqs)
+                    token_ids.extend(self.sampler(
+                        logits[sample_idx],
+                        temperatures[sample_idx],
+                        top_ps[sample_idx],
+                        [generators[i] for i in sample_idx],
+                    ).tolist())
+            reset_context()
         if self.rank != 0:
-            reset_context()
+            # worker 只负责前向与 KV 写入，不消费 logits/不采样（TP 语义沿用）
             return None
-        if not is_prefill:
-            temperatures, top_ps, generators = self.prepare_sample(seqs)
-            token_ids = self.sampler(logits, temperatures, top_ps, generators).tolist()
-            reset_context()
-            return token_ids
-        # ---------- Day8 prefill 采样契约 ----------
-        # 1) 行选择：ParallelLMHead 在 prefill 分支已按 cu_seqlens_q[1:]-1 把
-        #    每个请求的"最后一个 query 行"聚合为 [len(seqs), vocab]——批内第 i
-        #    行就是第 i 个请求的末 query logits（旧实现把整批 [T, hidden] 直接
-        #    交给 lm_head 后与 len(seqs) 的采样参数 zip，行语义成立但没有任何
-        #    显式校验，形状错位会静默发生）。这里显式断言行数与请求一一对应。
-        # 2) 中间 chunk 不采样、不消耗 RNG：torch.multinomial 会推进 generator
-        #    状态，若中间 chunk 也采样，chunk 划分不同就会改变 RNG 流，
-        #    "chunked 与 one-shot 输出一致"在随机采样下不可达。因此只有
-        #    offset + q == prefill_target 的最后 chunk 才进入采样。
-        if logits.shape[0] != len(seqs):
-            raise ValueError(
-                f"prefill logits 行数 {logits.shape[0]} 与请求数 {len(seqs)} 不一致，"
-                "每请求应恰好聚合出其最后 query 行")
-        sample_idx = self._select_prefill_sample_rows(seqs)
-        if not sample_idx:
-            # 本轮全部为中间 chunk：模型输出（logits）直接丢弃，无采样 token
-            reset_context()
-            return None
-        temperatures, top_ps, generators = self.prepare_sample(seqs)
-        token_ids = self.sampler(
-            logits[sample_idx],
-            temperatures[sample_idx],
-            top_ps[sample_idx],
-            [generators[i] for i in sample_idx],
-        ).tolist()
-        reset_context()
-        return token_ids
+        return token_ids if token_ids else None
 
     @staticmethod
     def _select_prefill_sample_rows(seqs: list[Sequence]):
         """CPU 纯逻辑（可被单元测试直接调用）：选出本轮需采样的请求下标。
 
-        只有最后 chunk（prefill_offset + num_scheduled_tokens == prefill_target）
-        的请求才采样。返回的批内下标同时是聚合后 logits [len(seqs), vocab]
+        只有最后 chunk（"本轮接纳即完成 prefill"具名谓词，Day9 单一权威）的
+        请求才采样。返回的批内下标同时是聚合后 logits [len(seqs), vocab]
         的行号：ParallelLMHead 已按 cu_seqlens_q[1:]-1 把每个请求的最后
         query 行放到第 i 行，无需再按扁平 token 位偏移选行。
         """
         sample_idx = []
         for i, seq in enumerate(seqs):
-            if seq.prefill_offset + seq.num_scheduled_tokens == seq.prefill_target:
+            if seq.is_last_chunk_scheduled:
                 sample_idx.append(i)
         return sample_idx
 
