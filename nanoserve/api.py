@@ -117,7 +117,7 @@ async def _stream_body(request: Request, service, internal, handle, *, chat: boo
         # admission 先于首帧，避免 add_request/worker 失败后仍返回 200 首帧。
         if not handle.wait_admission(timeout=5.0):
             return
-        if handle.terminal_error is not None:
+        if handle.terminal_error is not None or isinstance(handle.terminal_record, AbortedRequest):
             return
         yield _sse(first)
         while True:
@@ -194,6 +194,9 @@ def _streaming_response(request: Request, service, internal, *, chat: bool):
         if isinstance(error, APIError):
             raise error
         raise ServiceNotReadyError("request was rejected before streaming")
+    terminal = stream.terminal_record
+    if isinstance(terminal, AbortedRequest):
+        raise service.manager._abort_error(terminal, internal.request_id)
     return StreamingResponse(
         _stream_body(request, service, internal, stream, chat=chat),
         media_type="text/event-stream",

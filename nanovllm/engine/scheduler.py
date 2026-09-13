@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import threading
 from collections import deque
 from dataclasses import dataclass
@@ -13,6 +14,31 @@ from nanovllm.engine.completed_request import AbortedRequest, CompletedRequest, 
 
 # 模块级 logger：库代码不做 basicConfig，日志开关由调用方（验收脚本/服务层）控制
 logger = logging.getLogger(__name__)
+
+# TokenEvent 只属于 rank 0 控制面。默认容量必须是有限值，不能用无界 deque
+# 掩盖消费端失速；测试和直接构造 Config 的调用方可通过同名字段覆盖。
+DEFAULT_TOKEN_EVENT_QUEUE_SIZE = 1024
+
+
+class TokenEventBackpressureError(RuntimeError):
+    """TokenEvent 队列已满，拒绝静默丢弃本次采样结果。
+
+    异常在追加 completion token 之前抛出，因此本次 token 不会进入 Sequence，
+    随后的 Engine step 事务会把请求收敛为 AbortedRequest 并释放 KV；已有队列
+    内容仍可由调用方 drain，不能为了塞入新事件而覆盖旧 token。
+    """
+
+    def __init__(self, *, seq_id: int, request_id: str, capacity: int,
+                 pending: int):
+        self.seq_id = seq_id
+        self.request_id = request_id
+        self.capacity = capacity
+        self.pending = pending
+        super().__init__(
+            f"TokenEvent queue backpressure: request_id={request_id!r} "
+            f"seq_id={seq_id}, pending={pending}, capacity={capacity}; "
+            "sample was not committed")
+
 
 # ---------- 本轮决策原因（§5.1 原因分类：不把所有等待都算 budget） ----------
 # Day9 混合轮归因重构：phase_priority（"整轮被另一阶段占用"）随 decode-first
@@ -143,6 +169,17 @@ class Scheduler:
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        # TokenEvent 是控制面旁路，但仍必须有界。使用配置字段优先、环境变量
+        # 次之、固定默认值兜底；put_nowait 失败时由 step 事务报明确背压错误，
+        # 绝不等待消费者，也绝不先追加 token 后静默丢事件。
+        queue_size = getattr(config, "token_event_queue_size", None)
+        if queue_size is None:
+            queue_size = os.getenv("NANOSERVE_TOKEN_EVENT_QUEUE_SIZE")
+        if queue_size is None:
+            queue_size = DEFAULT_TOKEN_EVENT_QUEUE_SIZE
+        self.token_event_queue_size = validate_positive_int(
+            int(queue_size) if isinstance(queue_size, str) and queue_size.isdecimal()
+            else queue_size, "token_event_queue_size")
         # Day10 控制锁（§3.4）：保护控制面状态（cancel_requested/cancel_reason/
         # requests 索引/队列）与资源账本变更的线性化。request_cancel 信号入口与
         # schedule/postprocess 安全点都在锁内执行控制面读写；锁不跨越 GPU forward
@@ -172,8 +209,10 @@ class Scheduler:
         self.completed_records: deque[CompletedRequest] = deque()
         self.aborted_records: deque[AbortedRequest] = deque()
         # TokenEvent 与终态记录分离：事件在 token 成功追加后入队，终态记录仍
-        # 只由 _finalize 产生。worker 可按安全点顺序独立 drain，重复 drain 幂等。
+        # 只由 _finalize 产生。deque 不使用 maxlen（maxlen 会静默淘汰最旧 token）；
+        # 由 _enqueue_token_event 在锁内显式执行容量检查，满时抛出明确背压错误。
         self.token_events: deque[TokenEvent] = deque()
+        self.token_event_backpressure_total = 0
 
         # prefix lookup 统计只在每个请求首次 can_allocate 查询时计数；chunk/retry
         # 重试不会放大请求级分母，-1（容量失败）单独归类而非 miss。
@@ -648,6 +687,9 @@ class Scheduler:
                 "prefix_cache_hit_rate": (
                     self.prefix_cache_hits / self.prefix_cache_lookups
                     if self.prefix_cache_lookups else 0.0),
+                "token_event_queue_size": self.token_event_queue_size,
+                "token_event_queue_depth": len(self.token_events),
+                "token_event_backpressure_total": self.token_event_backpressure_total,
             }
 
     def _resource_snapshot(self) -> dict:
@@ -660,6 +702,24 @@ class Scheduler:
             events = list(self.token_events)
             self.token_events.clear()
             return events
+
+    def _ensure_token_event_capacity(self, event: TokenEvent) -> None:
+        """无阻塞地预留本次事件的容量，容量不足时显式失败。
+
+        该检查与 postprocess 处于同一控制锁内；通过先检查、后追加 token、再
+        入队，保证异常路径既不会静默丢事件，也不会留下“事件已发但 token 未
+        提交”的半成功状态。异常由 Engine step 事务统一收口并释放 KV。
+        """
+        if len(self.token_events) >= self.token_event_queue_size:
+            self.token_event_backpressure_total += 1
+            raise TokenEventBackpressureError(
+                seq_id=event.seq_id, request_id=event.request_id,
+                capacity=self.token_event_queue_size, pending=len(self.token_events))
+
+    def _enqueue_token_event(self, event: TokenEvent) -> None:
+        """在容量已检查后入队；此操作永不等待且不会淘汰旧事件。"""
+        self._ensure_token_event_capacity(event)
+        self.token_events.append(event)
 
     def _record_prefix_lookup(self, seq: Sequence, num_cached_blocks: int):
         """按请求世代只记录首次 lookup，避免 chunk/retry 重复放大统计。"""
@@ -1418,8 +1478,10 @@ class Scheduler:
             # 前的计数，避免首 token 被错误标成 1；中间 prefill 在上方 continue，
             # 因而永远不会进入此事件通道。
             completion_index = seq.num_completion_tokens
-            seq.append_token(token_id)
-            self.token_events.append(TokenEvent(
+            # 先尝试把事件放入有界控制面队列，再提交 token。队列满时抛出
+            # TokenEventBackpressureError，Engine 事务会清理活动请求；不能先
+            # 改 Sequence 再丢事件，否则流端无法恢复完整 token 序列。
+            token_event = TokenEvent(
                 seq_id=seq.seq_id,
                 request_id=seq.request_id,
                 round_id=it.round_id,
@@ -1428,7 +1490,10 @@ class Scheduler:
                 emitted_at=now,
                 is_first_token=completion_index == 0,
                 phase=it.phase,
-            ))
+            )
+            self._ensure_token_event_capacity(token_event)
+            seq.append_token(token_id)
+            self._enqueue_token_event(token_event)
             # 完成判定：EOS 触发记为 stop，达到 max_tokens 记为 length；
             # mark_finished 幂等，配合 _finalize 保证不 double free
             if not seq.ignore_eos and token_id == self.eos:

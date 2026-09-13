@@ -188,6 +188,7 @@ class RequestHandle:
     last_token_at: float | None = None
     timeline: object | None = None
     next_completion_index: int = 0
+    deadline: float | None = None
 
 
 class StreamBackpressureError(APIError):
@@ -244,6 +245,12 @@ class StreamHandle:
     def terminal_error(self) -> BaseException | None:
         with self._lock:
             return self._error
+
+    @property
+    def terminal_record(self):
+        with self._lock:
+            return (self._terminal.record if self._terminal is not None
+                    else None)
 
     def bind_seq_id(self, seq_id: int) -> bool:
         with self._lock:
@@ -551,7 +558,8 @@ class RequestManager:
             handle = RequestHandle(request_id=request.request_id,
                                    kind=request.kind,
                                    created_at=request.created_at,
-                                   stream=stream_handle)
+                                   stream=stream_handle,
+                                   deadline=request.deadline)
             if self._observer is not None:
                 try:
                     handle.timeline = self._observer.start_request(
@@ -574,9 +582,28 @@ class RequestManager:
                 raise
         return handle
 
-    def wait(self, handle: RequestHandle) -> CompletionResult:
-        """等待 worker 收口；失败以 APIError 子类异常透传给路由。"""
-        return handle.future.result()
+    def wait(self, handle: RequestHandle, timeout: float | None = None) -> CompletionResult:
+        """有限等待 worker 收口；超时通过统一取消入口终止请求。"""
+        if timeout is None:
+            if handle.deadline is not None:
+                timeout = max(0.0, handle.deadline - perf_counter())
+            else:
+                timeout = 30.0
+        try:
+            return handle.future.result(timeout=max(0.001, timeout))
+        except TimeoutError as exc:
+            self.cancel(handle.request_id, reason="timeout")
+            try:
+                return handle.future.result(timeout=1.0)
+            except TimeoutError:
+                # worker 无法在有限窗口收口时，先从 pending 移除并让调用者
+                # 得到明确 504；底层 worker 仍由自己的安全边界继续清理。
+                with self._lock:
+                    self._pending.pop(handle.request_id, None)
+                    self._cancel_requested.pop(handle.request_id, None)
+                raise RequestTimeoutError(
+                    "request exceeded its service wait deadline",
+                    request_id=handle.request_id) from exc
 
     def stop_accepting(self) -> None:
         """优雅关闭第一步：新请求一律 503（与 worker 退出线性化）。"""
@@ -587,6 +614,8 @@ class RequestManager:
 
     def bind_seq_id(self, request_id: str, seq_id: int) -> bool:
         """绑定 Engine admission 后的 seq_id，供迟到记录做世代校验。"""
+        admission_event = None
+        timeline = None
         with self._lock:
             handle = self._pending.get(request_id)
             if handle is None or handle.seq_id is not None:
@@ -597,38 +626,46 @@ class RequestManager:
                 handle.stream.bind_seq_id(seq_id)
             timeline = getattr(handle, "timeline", None)
             if timeline is not None:
-                try:
-                    timeline.seq_id = seq_id
-                    timeline.mark_admitted(handle.admitted_at)
-                    self._observer.emit("request_admitted",
-                                       request_id=request_id, seq_id=seq_id,
-                                       kind=handle.kind,
-                                       observed_at=handle.admitted_at)
-                except Exception:
-                    pass
-            return True
+                timeline.seq_id = seq_id
+                timeline.mark_admitted(handle.admitted_at)
+                admission_event = (request_id, seq_id, handle.kind,
+                                   handle.admitted_at)
+        # 日志/指标是旁路，不能在 manager 锁内执行可能调用用户 handler 的操作。
+        if timeline is not None and self._observer is not None:
+            try:
+                self._observer.emit("request_admitted",
+                                   request_id=admission_event[0],
+                                   seq_id=admission_event[1],
+                                   kind=admission_event[2],
+                                   observed_at=admission_event[3])
+                # admission 成功即记入 prompt token counter；终态收口只
+                # 负责延迟指标，避免长期运行请求在完成前漏计。
+                self._observer.record_timeline(timeline)
+            except Exception:
+                pass
+        return True
 
     def stream_handle(self, request_id: str) -> StreamHandle | None:
         with self._lock:
             handle = self._pending.get(request_id)
             return handle.stream if handle is not None else None
 
-    def resolve_token_event(self, event: TokenEvent) -> bool:
-        """校验 request+seq 世代并记录 token；流请求再发布到 sink。"""
+    def resolve_token_event_status(self, event: TokenEvent) -> str:
+        """处理 token event 并返回 ``accepted/stale/invalid/backpressure`` 分类。"""
+        observer_event = None
         with self._lock:
             handle = self._pending.get(event.request_id)
             if handle is None or handle.seq_id != event.seq_id:
                 logger.warning("忽略未知/迟到 token 事件: request_id=%s seq_id=%s",
                                event.request_id, event.seq_id)
-                return False
+                return "stale"
             expected = handle.next_completion_index
-            if event.completion_index != expected:
+            if event.completion_index != expected or \
+                    event.is_first_token != (expected == 0):
                 logger.warning("忽略非连续 token 事件: request_id=%s seq_id=%s index=%s expected=%s",
                                event.request_id, event.seq_id,
                                event.completion_index, expected)
-                return False
-            if event.is_first_token != (expected == 0):
-                return False
+                return "invalid"
             handle.next_completion_index = expected + len(event.token_ids)
             if handle.first_token_at is None and event.token_ids:
                 handle.first_token_at = event.emitted_at
@@ -645,15 +682,17 @@ class RequestManager:
                             request_id=event.request_id, seq_id=event.seq_id,
                             round_id=event.round_id, completion_index=event.completion_index,
                             phase=getattr(event, "phase", "decode"),
-                        observed_at=event.emitted_at)
+                            observed_at=event.emitted_at)
                 except Exception:
                     pass
             sink = handle.stream
         # 非流式请求也要消费事件以记录指标，但不需要入队。
         if sink is None:
-            return True
-        ok = sink.publish(event)
-        return bool(ok)
+            return "accepted"
+        return "accepted" if sink.publish(event) else "backpressure"
+
+    def resolve_token_event(self, event: TokenEvent) -> bool:
+        return self.resolve_token_event_status(event) == "accepted"
 
     def cancel(self, request_id: str, reason: str = "client_cancelled") -> bool:
         """取消请求并覆盖尚未 admission 的窗口。"""
@@ -665,7 +704,10 @@ class RequestManager:
             worker = self._worker
         if worker is None:
             return False
-        return worker.cancel(request_id, reason)
+        cancel = getattr(worker, "cancel", None)
+        if cancel is None:
+            return False
+        return cancel(request_id, reason)
 
     def is_cancel_requested(self, request_id: str) -> bool:
         with self._lock:
@@ -685,8 +727,8 @@ class RequestManager:
         """
         with self._lock:
             handle = self._pending.get(record.request_id)
-            if handle is None or (handle.seq_id is not None
-                                  and handle.seq_id != record.seq_id):
+            if handle is None or (handle.seq_id is None and handle.stream is not None) \
+                    or (handle.seq_id is not None and handle.seq_id != record.seq_id):
                 handle = None
             else:
                 handle = self._pending.pop(record.request_id)
@@ -727,8 +769,8 @@ class RequestManager:
         """取消/超时/异常记录 → 按原因映射为失败收口（不伪装成成功）。"""
         with self._lock:
             handle = self._pending.get(record.request_id)
-            if handle is None or (handle.seq_id is not None
-                                  and handle.seq_id != record.seq_id):
+            if handle is None or (handle.seq_id is None and handle.stream is not None) \
+                    or (handle.seq_id is not None and handle.seq_id != record.seq_id):
                 handle = None
             else:
                 handle = self._pending.pop(record.request_id)
@@ -765,11 +807,6 @@ class RequestManager:
             self._observer.record_timeline(
                 timeline, status=metric_status, finish_reason=reason,
                 log_event=True)
-            if metric_status != "completed":
-                self._observer.emit("request_aborted", request_id=timeline.request_id,
-                                   seq_id=timeline.seq_id, kind=timeline.kind,
-                                   status=metric_status, finish_reason=reason,
-                                   latency_seconds=timeline.latency_seconds)
         except Exception:
             logger.exception("request observability update failed")
 
@@ -818,11 +855,8 @@ class RequestManager:
             timeline.mark_finished(perf_counter())
             reason = getattr(exc, "code", "engine_error")
             status = "server_shutdown" if "draining" in reason else "engine_error"
-            self._observer.record_timeline(timeline, status=status, log_event=True)
-            self._observer.emit("request_aborted", request_id=handle.request_id,
-                               seq_id=handle.seq_id, kind=handle.kind,
-                               status=status, finish_reason=reason,
-                               observed_at=timeline.finished_at)
+            self._observer.record_timeline(
+                timeline, status=status, finish_reason=reason, log_event=True)
         except Exception:
             pass
 

@@ -1,4 +1,4 @@
-{"case": "completion_sse_contract", "status": "pass", "observed_at": 2006982.890001125, "http_status": 200}
-{"case": "chat_sse_contract", "status": "pass", "observed_at": 2006982.895243242, "http_status": 200}
-{"case": "metrics_contract", "status": "pass", "observed_at": 2006982.898950189, "http_status": 200}
-{"case": "worker_single_owner", "status": "pass", "observed_at": 2006982.900930351, "step_threads": 1}
+{"case": "completion_sse_contract", "status": "pass", "observed_at": 2011890.516344439, "http_status": 200}
+{"case": "chat_sse_contract", "status": "pass", "observed_at": 2011890.521755415, "http_status": 200}
+{"case": "metrics_contract", "status": "pass", "observed_at": 2011890.525375741, "http_status": 200}
+{"case": "worker_single_owner", "status": "pass", "observed_at": 2011890.527302298, "step_threads": 1}

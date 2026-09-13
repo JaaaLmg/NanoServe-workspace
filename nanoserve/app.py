@@ -252,6 +252,15 @@ def create_app(engine_factory: Callable[[ServerConfig], EngineBundle] | None = N
 
     @app.exception_handler(APIError)
     async def api_error_handler(request: Request, exc: APIError):
+        service = getattr(request.app.state, "service", None)
+        observer = getattr(service, "observability", None)
+        if observer is not None:
+            try:
+                observer.emit("request_rejected",
+                              request_id=exc.request_id,
+                              stage="service", error_code=exc.code)
+            except Exception:
+                pass
         return api._error_response(exc)
 
     @app.exception_handler(RequestValidationError)
@@ -266,6 +275,13 @@ def create_app(engine_factory: Callable[[ServerConfig], EngineBundle] | None = N
         error = InvalidRequestShim(
             f"invalid value for field {loc!r}: {first.get('type', 'invalid')}",
             param=loc)
+        try:
+            observer = getattr(request.app.state.service, "observability", None)
+            if observer is not None:
+                observer.emit("request_rejected", stage="validation",
+                              error_code=error.code)
+        except Exception:
+            pass
         return api._error_response(error)
 
     @app.exception_handler(Exception)

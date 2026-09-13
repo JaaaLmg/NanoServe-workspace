@@ -6,7 +6,8 @@
 
 - 分支：`feature/sse-observability-day13-14`
 - Day12 基线：`1de08bc`（`merge: integrate Day11-12 OpenAI APIs`）
-- 实现提交：待本记录完成后创建
+- 基础实现提交：`35ceac1`
+- 本轮加固与教程提交：待本记录完成后创建
 - 工作区模型/权重：CPU FakeEngine 验收使用 `/tmp/fake`，不加载模型权重，不初始化 CUDA/NCCL。
 
 ## 2. 实现范围
@@ -43,30 +44,47 @@ python -m pytest tests/test_service_sse.py tests/test_stream_disconnect.py \
 
 结果：`16 passed, 1 warning`。
 
-### 3.3 关键服务回归
+### 3.3 验收加固测试
+
+```bash
+python -m pytest tests/test_day13_14_hardening.py -q
+```
+
+结果：`4 passed`，覆盖旧世代 token 不误取消、未绑定 seq 的记录不误收口、有限等待超时清理和 admission 时 prompt 计数。
+
+### 3.4 当前工作区修复后的服务回归
+
+```bash
+python -m pytest tests/test_day13_14_hardening.py tests/test_engine_worker.py \
+  tests/test_service_api.py tests/test_service_sse.py tests/test_stream_disconnect.py -q
+```
+
+结果：`64 passed, 1 warning`。
+
+### 3.5 关键服务回归
 
 ```bash
 python -m pytest tests/test_service_api.py tests/test_engine_worker.py \
   tests/test_observability_unit.py -q
 ```
 
-结果：`61 passed, 1 warning`。
+结果：`61 passed, 1 warning`（基础实现阶段）。
 
-### 3.4 全量 CPU 回归
+### 3.6 全量 CPU 回归
 
 ```bash
 python -m pytest -q
 ```
 
-结果：`511 passed, 1 warning`。
+结果：`520 passed, 1 warning`。
 
 ```bash
 python -O -m pytest -q
 ```
 
-结果：`511 passed, 2 warnings`。
+结果：`520 passed, 2 warnings`。
 
-### 3.5 CPU OpenAI/SSE 验收脚本
+### 3.7 CPU OpenAI/SSE 验收脚本
 
 ```bash
 python scripts/validate_openai_api.py --mode cpu
@@ -92,11 +110,11 @@ python scripts/validate_sse_observability.py --mode cpu \
 | 流/非流最终文本和 usage 一致 | 通过（FakeTokenizer） | `test_stream_aggregates_same_as_non_stream` |
 | `stop`/`length` 与底层终态一致 | 通过（CPU fake） | SSE finish assertions |
 | mixed prefill/decode 事件过滤与映射 | 通过（底层 CPU 回归） | Scheduler/mixed-batch tests |
-| request ID + seq ID 事件世代隔离 | 部分通过 | 既有完成记录隔离通过；异常/迟到 TokenEvent 的扩展覆盖需继续补充 |
-| 首 token 前、token 间、完成竞争断连 | 部分通过 | worker-level disconnect 通过；ASGI/TestClient 不等价于真实 TCP 断连 |
-| 断连触发 `client_disconnected` 并释放 active/pending/KV | 部分通过 | CPU fake worker 路径通过；真实 TCP/GPU 未完成 |
-| Engine error/timeout/shutdown 不伪造成功 finish | 部分通过 | 非流式和 worker 异常回归通过；流式异常专门证据需补充 |
-| `step()`/`generate()`/非流式 API 兼容 | 通过（CPU） | 全量 511 passed |
+| request ID + seq ID 事件世代隔离 | 通过（CPU） | `test_day13_14_hardening.py` 覆盖旧世代事件不误取消新请求 |
+| 首 token 前、token 间、完成竞争断连 | 部分通过 | CPU worker/ASGI 覆盖；真实 TCP 只验证主动关闭后的恢复，不可观测服务内 cancel 原因 |
+| 断连触发 `client_disconnected` 并释放 active/pending/KV | 部分通过 | CPU worker 路径通过；真实 TCP 后续请求恢复通过，但内部 cancel/KV 快照未从外部进程直接读取 |
+| Engine error/timeout/shutdown 不伪造成功 finish | 通过（CPU/ASGI） | 首帧前 admission error、终态错误和有限等待由加固测试覆盖 |
+| `step()`/`generate()`/非流式 API 兼容 | 通过（CPU） | 全量 520 passed |
 
 ### 4.2 Day14 指标与结构化日志
 
@@ -105,30 +123,27 @@ python scripts/validate_sse_observability.py --mode cpu \
 | `/metrics` 可抓取并包含 9 个计划指标 | 通过（CPU/ASGI） | `tests/test_observability.py` |
 | queue wait、TTFT、TPOT/ITL、latency 口径 | 通过（primitive） | `tests/test_observability*.py`；统一 `perf_counter` |
 | 无首 token/少于两个 token 不伪造 TTFT/TPOT | 通过（primitive） | timeline 测试 |
-| prompt/generation token 计数 | 通过（单请求 happy path） | metrics smoke；中止/异常口径仍需扩展 |
+| prompt/generation token 计数 | 部分通过 | admission prompt 与正常生成已验证；中止/Engine error 的完整 token usage 仍按实际 TokenEvent 口径统计 |
 | running、KV used/total/utilization | 部分通过 | 底层 resource snapshot 通过；HTTP metrics 当前主要暴露 running/utilization |
-| prefix hit/miss/capacity failure 统计 | 部分通过 | 底层分类通过；服务抓取后的累计 counter 需最终脚本复核 |
+| prefix hit/miss/capacity failure 统计 | 通过（CPU） | 底层分类与 snapshot counter 差分/重复抓取幂等已覆盖 |
 | lifecycle JSON envelope 与隐私白名单 | 通过（CPU primitive） | `test_structured_log_drops_sensitive_fields` |
-| received→submitted→admitted→first token→finished/aborted 可串联 | 部分通过 | happy path 已接线；异常/断连全链需补真实事件证据 |
+| received→submitted→admitted→first token→finished/aborted 可串联 | 部分通过 | CPU happy path 与 service rejection 已接线；真实 TCP 进程内日志链未单独导出 |
 | 观测异常不阻塞 Engine | 部分通过 | 抛异常隔离有测试；慢 handler、永久阻塞未实测 |
 | 低基数 labels、registry 隔离 | 通过（CPU primitive） | observability unit tests |
 
 ## 5. 模型/GPU/真实 TCP 可用性
 
 - 本轮 CPU/ASGI 测试不依赖模型权重或 GPU。
-- RTX 4090 D、Qwen3-0.6B、TP=1、`enforce_eager=True` 曾在 Day11–12 做过最小 HTTP 验收，但本轮 Day13–14 尚未重新执行真实 GPU 流式验证。
-- 真实 TCP 断连、GPU 流式 completion/chat、GPU `/metrics` 和断连后 KV 稳定性尚未实测，不能标记为通过。
+- RTX 4090 D、Qwen3-0.6B、TP=1、`enforce_eager=True` 在本轮已重新执行最小真实 HTTP 验收。
+- GPU completion/chat SSE、GPU `/metrics` 和真实 TCP 主动关闭后的后续请求恢复已通过；内部 cancel reason 与断连后 KV 快照未从外部进程直接读取。
 - TP>1、CUDA Graph、GPU 高并发、长时间压力、Engine 永久阻塞和进程级 supervisor 回收仍未覆盖。
 
 ## 6. 未覆盖边界与后续修复
 
-1. 需要补真实 Uvicorn + `httpx.Client.stream()` 主动关闭连接的断连证据，确认 `client_disconnected`、pending/active 清零以及后续请求可继续服务。
-2. 需要补流式首帧前 admission/step error 的真实 ASGI 错误响应测试，以及首帧后的错误关闭语义。
-3. 需要补 stream queue size=1 的背压测试，确保不丢 token、不发送伪造成功 finish，并只影响单个流。
-4. 需要补 TokenEvent 重复/乱序/completion_index 跳跃和无 `get_request()` Engine 兼容测试。
-5. 需要补 abort/engine_error/server_shutdown 的指标状态与生命周期日志数值断言。
-6. 需要补慢日志 handler 和观测异常旁路测试；当前只验证“抛异常”而未验证“阻塞很久”。
-7. 需要在 GPU/模型可用时执行最小真实流式和资源验证；不将历史 Day11–12 GPU 结果替代本轮证据。
+1. 真实 TCP 主动关闭后的后续请求恢复已验证，但服务内 `client_disconnected` cancel reason、pending/active 和 KV 快照尚未通过独立管理端点导出，仍需进程内证据。
+2. TP>1、CUDA Graph、GPU 高并发和长时间压力尚未实测。
+3. 慢日志 handler 的阻塞隔离、Engine 永久阻塞和进程级 supervisor 回收仍未覆盖。
+4. Aborted 请求的完整 token usage 只按实际 TokenEvent 统计，未扩展底层 AbortedRequest 的 token 字段。
 
 ## 7. 结论
 

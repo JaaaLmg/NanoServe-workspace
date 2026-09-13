@@ -447,6 +447,12 @@ class Observability:
             else:
                 self._prefix_misses += 1
             hits = self._prefix_hits
+            # direct record 与 snapshot refresh 共用同一累计游标，避免同一
+            # lookup 先由事件记录、后被资源快照再次导出而 double count。
+            self._prefix_exported = (self._prefix_lookups,
+                                     self._prefix_hits,
+                                     self._prefix_misses,
+                                     self._prefix_capacity_failures)
         self._observe(lambda: self.prefix_cache_lookups_total.inc(), "prefix lookup")
         if capacity_failure:
             self._observe(lambda: self.prefix_cache_capacity_failures_total.inc(),

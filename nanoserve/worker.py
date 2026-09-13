@@ -244,16 +244,30 @@ class EngineWorker:
             # 若 Engine 只返回 request_id，则完成记录的 seq_id 校验在
             # record 通道中退化为 request_id 校验，保持旧接口兼容。
             if isinstance(seq_id, int):
-                self._manager.bind_seq_id(request.request_id, seq_id)
+                bound = self._manager.bind_seq_id(request.request_id, seq_id)
             else:
                 # LLMEngine 为兼容旧 API 返回 request_id；在 admission 后
                 # 立即读取一次内部 seq_id 仅用于世代绑定，不向服务层暴露 Sequence。
                 get_request = getattr(self._engine, "get_request", None)
                 admitted = get_request(request.request_id) \
                     if get_request is not None else None
-                if admitted is not None:
-                    self._manager.bind_seq_id(request.request_id,
-                                              admitted.seq_id)
+                bound = (self._manager.bind_seq_id(request.request_id,
+                                                    admitted.seq_id)
+                         if admitted is not None else False)
+            if not bound:
+                self._manager.fail_request(
+                    request.request_id,
+                    lambda: EngineError("engine did not provide request identity"))
+                try:
+                    self._engine.cancel_request(request.request_id,
+                                                reason="engine_error")
+                except BaseException:
+                    pass
+                return
+            # admission 与断连可能并发：add/bind 完成后再次检查取消标志，
+            # 仍只通过 Engine cancel 入口处理，不直接触碰底层资源。
+            if self._manager.is_cancel_requested(request.request_id):
+                self.cancel(request.request_id, reason="client_disconnected")
         except BaseException as exc:
             logger.error("add_request 失败: request_id=%s, %s: %s",
                          request.request_id, type(exc).__name__, exc)
@@ -284,12 +298,13 @@ class EngineWorker:
                             is_final=getattr(event, "is_final", False),
                             finish_reason=getattr(event, "finish_reason", None),
                             phase=getattr(event, "phase", "decode"))
-                    if not self._manager.resolve_token_event(event):
-                        # sink 背压/未知事件不应阻断同轮其他请求。仅当活动 sink
-                        # 已关闭时发 signal-only cancel，真正资源收尾仍在安全点。
-                        logger.warning("token event 未被流句柄接收: request_id=%s seq_id=%s",
-                                       event.request_id, event.seq_id)
-                        if self._manager.stream_handle(event.request_id) is not None:
+                    event_status = self._manager.resolve_token_event_status(event)
+                    if event_status != "accepted":
+                        # 未知/迟到/序号错误世代只能丢弃；只有当前句柄明确
+                        # 报告背压时才取消，避免旧事件按 request_id 误伤新请求。
+                        logger.warning("token event 未被流句柄接收: request_id=%s seq_id=%s status=%s",
+                                       event.request_id, event.seq_id, event_status)
+                        if event_status == "backpressure":
                             self.cancel(event.request_id, reason="stream_backpressure")
                 except BaseException as exc:
                     logger.error("token 事件消费失败: %s: %s", type(exc).__name__, exc)
