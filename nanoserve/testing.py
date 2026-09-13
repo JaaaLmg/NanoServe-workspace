@@ -25,6 +25,10 @@ import time
 from time import perf_counter
 
 from nanovllm.engine.completed_request import AbortedRequest, CompletedRequest
+try:
+    from nanovllm.engine.completed_request import TokenEvent
+except ImportError:  # bottom layer may land the DTO after this test stub
+    from nanoserve.service import TokenEvent
 
 from nanoserve.app import EngineBundle
 
@@ -33,7 +37,7 @@ class FakeTokenizer:
     """确定性 tokenizer 桩：字符 → ord 映射，记录 chat template 调用参数。"""
 
     def __init__(self, *, template_error: Exception | None = None,
-                 template_style: str = "list"):
+                 template_style: str = "list", token_text: dict[int, str] | None = None):
         """template_style 模拟不同 transformers 版本的模板返回类型：
         - "list": list[int]（tokenize=True 的经典返回）
         - "dict": 含 input_ids 的 BatchEncoding 形态（transformers 5.x）
@@ -44,14 +48,18 @@ class FakeTokenizer:
         self.decode_calls: list[list[int]] = []
         self.template_error = template_error
         self.template_style = template_style
+        self.token_text = dict(token_text or {})
 
     def encode(self, text: str) -> list[int]:
         self.encode_calls.append(text)
         return [ord(ch) % 999 + 1 for ch in text]
 
     def decode(self, token_ids) -> str:
-        self.decode_calls.append(list(token_ids))
-        return f"text<{len(token_ids)}>"
+        ids = list(token_ids)
+        self.decode_calls.append(ids)
+        if self.token_text:
+            return "".join(self.token_text.get(token, f"<{token}>") for token in ids)
+        return f"text<{len(ids)}>"
 
     def apply_chat_template(self, messages, tokenize=True,
                             add_generation_prompt=False, **kwargs):
@@ -87,11 +95,18 @@ class FakeEngine:
     def __init__(self, *, tokenizer: FakeTokenizer | None = None,
                  completion_tokens: tuple[int, ...] = (21, 22, 23),
                  step_script: list | None = None,
+                 token_event_script: list | None = None,
+                 token_events_script: list | None = None,
                  fail_add_request: bool = False,
                  step_delay: float = 0.0):
         self.tokenizer = tokenizer or FakeTokenizer()
         self.completion_tokens = completion_tokens
         self.step_script = list(step_script or [])
+        # 每个 step 取一个脚本轮次；轮次可为 {request_id: token_ids}，或
+        # [(request_id, token_ids)]，用于模拟真实 Engine 的增量事件通道。
+        self.token_event_script = list(
+            token_event_script if token_event_script is not None
+            else (token_events_script or []))
         self.fail_add_request = fail_add_request
         # 每轮 step 前的固定延迟：模拟真实 forward 耗时，让"运行中"窗口可观测
         self.step_delay = step_delay
@@ -99,6 +114,10 @@ class FakeEngine:
         self.active: dict[str, dict] = {}
         self.completed_records: list[CompletedRequest] = []
         self.aborted_records: list[AbortedRequest] = []
+        self.token_events: list[TokenEvent] = []
+        self._round_id = 0
+        self.resource = {"running": 0, "waiting": 0, "paused": 0,
+                         "active": 0, "used_blocks": 0, "total_blocks": 0}
         # 观测记录
         self.step_calls = 0
         self.step_thread_ids: set[int] = set()
@@ -123,16 +142,46 @@ class FakeEngine:
         }
         self.added_requests.append(
             (tuple(prompt_token_ids), sampling_params, rid, deadline))
+        self.resource["active"] = len(self.active)
+        self.resource["waiting"] = len(self.active)
         return rid
 
     def has_active_requests(self) -> bool:
         return bool(self.active)
+
+    def get_request(self, request_id):
+        info = self.active.get(request_id)
+        if info is None:
+            return None
+        return type("FakeSequence", (), {"seq_id": info["seq_id"]})()
 
     def step(self):
         self.step_calls += 1
         self.step_thread_ids.add(threading.get_ident())
         if self.step_delay:
             time.sleep(self.step_delay)
+        self._round_id += 1
+        if self.token_event_script:
+            scripted = self.token_event_script.pop(0)
+            if isinstance(scripted, BaseException):
+                raise scripted
+            if isinstance(scripted, dict):
+                scripted = list(scripted.items())
+            for rid, tokens in scripted or []:
+                info = self.active.get(rid)
+                if info is None:
+                    continue
+                if isinstance(tokens, int):
+                    tokens = (tokens,)
+                token_ids = tuple(tokens)
+                index = info.setdefault("completion_index", 0)
+                self.token_events.append(TokenEvent(
+                    seq_id=info["seq_id"], request_id=rid,
+                    round_id=self._round_id, token_ids=token_ids,
+                    completion_index=index, emitted_at=perf_counter(),
+                        is_first_token=(index == 0), phase="decode"))
+
+                info["completion_index"] = index + len(token_ids)
         action = self.step_script.pop(0) if self.step_script else None
         if isinstance(action, BaseException):
             raise action
@@ -149,9 +198,27 @@ class FakeEngine:
             info = self.active.pop(rid, None)
             if info is None:
                 continue
+            self.resource["active"] = len(self.active)
+            self.resource["waiting"] = len(self.active)
             tokens = tuple(override_tokens
                            if override_tokens is not None
                            else self.completion_tokens[:info["max_tokens"]])
+            # 默认完成脚本也模拟真实 Engine 的逐 token 事件；按请求记录
+            # 是否已有显式事件，不能用全局队列是否为空判断（多请求合批时，
+            # 前一个请求的事件会让后一个请求错误地跳过增量输出）。
+            scripted_ids = set()
+            for event in self.token_events:
+                if event.request_id == rid and event.round_id == self._round_id:
+                    scripted_ids.add(event.request_id)
+            if rid not in scripted_ids:
+                index = 0
+                for token_id in tokens:
+                    self.token_events.append(TokenEvent(
+                        seq_id=info["seq_id"], request_id=rid,
+                        round_id=self._round_id, token_ids=(token_id,),
+                        completion_index=index, emitted_at=perf_counter(),
+                        is_first_token=index == 0, phase="decode"))
+                    index += 1
             finished_at = perf_counter()
             self.completed_records.append(CompletedRequest(
                 seq_id=info["seq_id"], request_id=rid,
@@ -164,6 +231,11 @@ class FakeEngine:
                 finished_at=finished_at))
             outputs.append((info["seq_id"], list(tokens)))
         return outputs, len(outputs)
+
+    def pop_token_events(self) -> list[TokenEvent]:
+        records = list(self.token_events)
+        self.token_events.clear()
+        return records
 
     def pop_completed(self) -> list[CompletedRequest]:
         records = list(self.completed_records)
@@ -180,11 +252,23 @@ class FakeEngine:
         info = self.active.pop(request_id, None)
         if info is None:
             return False
+        self.resource["active"] = len(self.active)
+        self.resource["waiting"] = len(self.active)
         self.aborted_records.append(AbortedRequest(
             seq_id=info["seq_id"], request_id=request_id,
             # 保留 Day10 控制面的首次取消原因，服务层据此映射错误。
             finish_reason=reason, finished_at=perf_counter()))
         return True
+
+    def resource_snapshot(self) -> dict:
+        """返回独立快照，测试可验证服务层不会持有 Engine 可写对象。"""
+        snapshot = dict(self.resource)
+        snapshot["active"] = len(self.active)
+        snapshot["running"] = len(self.active)
+        snapshot["waiting"] = 0
+        return snapshot
+
+    snapshot = resource_snapshot
 
     def exit(self) -> None:
         # 幂等：与真实 LLMEngine.exit 一致——退出后的重复调用是安全空操作

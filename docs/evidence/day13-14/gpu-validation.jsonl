@@ -1,0 +1,5 @@
+{"case":"gpu_server_readiness","status":"pass","model":"Qwen3-0.6B","gpu":"NVIDIA GeForce RTX 4090 D","tensor_parallel_size":1,"enforce_eager":true,"http_status":200}
+{"case":"gpu_completion_sse","status":"pass","http_status":200,"content_type":"text/event-stream; charset=utf-8","data_frames":6,"done_frames":1}
+{"case":"gpu_chat_sse","status":"pass","http_status":200,"content_type":"text/event-stream; charset=utf-8","data_frames":6,"done_frames":1}
+{"case":"gpu_metrics","status":"pass","http_status":200,"required_metrics":true}
+{"case":"gpu_tcp_disconnect_recovery","status":"pass","first_chunk":true,"follow_up_http_status":200,"follow_up_request_ok":true,"note":"client-side stream close and post-close recovery verified; internal cancel event not externally exposed by this script"}

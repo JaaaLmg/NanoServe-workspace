@@ -232,20 +232,23 @@ class TestErrorContract:
             assert resp.json()["error"]["code"] == "context_length_exceeded"
             assert engine.added_requests == []
 
-    def test_stream_true_returns_501_both_routes(self):
-        """stream=true 显式 501，绝不静默退化为非流式。"""
-        with make_client() as client:
-            for route, payload in [
+    def test_stream_true_returns_sse_both_routes(self):
+        """stream=true 进入 SSE，而不是静默退化或返回旧的 501。"""
+        tokenizer = FakeTokenizer(token_text={21: "A", 22: "B", 23: "C"})
+        engine = FakeEngine(tokenizer=tokenizer, completion_tokens=(21, 22, 23))
+        with make_client(make_fake_factory(engine=engine)) as client:
+            for route, payload, prefix in [
                 ("/v1/completions", {"model": MODEL_ID, "prompt": "x",
-                                     "stream": True}),
+                                     "stream": True}, "cmpl-"),
                 ("/v1/chat/completions", {"model": MODEL_ID, "messages": [
-                    {"role": "user", "content": "x"}], "stream": True}),
+                    {"role": "user", "content": "x"}], "stream": True},
+                 "chatcmpl-"),
             ]:
                 resp = client.post(route, json=payload)
-                assert resp.status_code == 501
-                error = resp.json()["error"]
-                assert error["code"] == "stream_not_implemented"
-                assert error["type"] == "invalid_request_error"
+                assert resp.status_code == 200
+                assert resp.headers["content-type"].startswith("text/event-stream")
+                assert resp.text.count("data: [DONE]") == 1
+                assert prefix in resp.text
 
     def test_template_error_maps_to_400(self):
         tokenizer = FakeTokenizer(

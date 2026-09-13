@@ -38,6 +38,8 @@
 - [Day 11–12 验收记录](./day11-12-validation.md)：实现范围、修复后的 CPU 117 项服务测试与全量 495 项回归（含 `python -O`）、CPU ASGI 18 项与 GPU RTX 4090 D TP=1 eager 严格 HTTP 8 项验收；区分脚本证据、手工观察和未覆盖生产边界，原始 JSONL 位于 `docs/evidence/day11-12/`。
 - [Day 11–12 实现审查](./day11-12-review.md)：对照设计文档复核服务、worker、完成记录、上下文校验、并发/关闭生命周期和验收脚本；记录修复项、代码简化建议及 TP>1、CUDA Graph、SSE/断连、GPU 504 和长期压力等未覆盖边界。
 - [Day 11–12 教程](./day11-12-tutorial.md)：面向初学者讲解 HTTP 到 Engine 的完整请求链路、统一 InternalRequest、chat template、完成记录、单 worker 批处理、Future/取消/关闭、测试方法、典型缺陷和后续 Day13/14 衔接。
+- [Day 13–14 SSE 与可观测性设计](./sse-observability-day13-14.md)：合并规划 SSE 首/增量/finish/[DONE]、客户端断连与 KV 清理、独立 TokenEvent、Prometheus 指标、请求级结构化日志、测试矩阵和 CPU/TCP/GPU 验收方案；设计基线与实现结果分别以本文和 [验收记录](./day13-14-validation.md) 为准。
+- [Day 13–14 验收记录](./day13-14-validation.md)：记录 SSE、断连、Prometheus 指标、结构化日志的实际测试命令、结果、CPU/模型/GPU 可用性与未覆盖边界。
 
 ## 其他
 

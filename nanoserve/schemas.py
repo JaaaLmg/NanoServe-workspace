@@ -67,9 +67,9 @@ class ChatCompletionRequest(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1,
                                         description="至少一条消息")
     max_tokens: int = Field(default=DEFAULT_MAX_TOKENS, ge=1, strict=True)
-    temperature: float = Field(default=1.0, ge=0)
-    top_p: float = Field(default=1.0, gt=0, le=1)
-    stream: bool = False
+    temperature: float = Field(default=1.0, ge=0, strict=True)
+    top_p: float = Field(default=1.0, gt=0, le=1, strict=True)
+    stream: bool = Field(default=False, strict=True)
 
 
 # ---------- 非流式成功响应模型 ----------
