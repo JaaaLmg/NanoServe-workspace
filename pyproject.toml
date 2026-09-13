@@ -17,12 +17,20 @@ dependencies = [
     # 仅支持 Ampere(sm_80) 及以上架构；Turing 卡（如 RTX 2080 Ti）需等待 SDPA 后备实现
     "flash-attn>=2.8.0",
     "xxhash",
+    # Day11–12：nanoserve OpenAI 兼容 HTTP 服务（nanoserve 包）的最小运行依赖
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
 ]
 
 [project.optional-dependencies]
 # 模型下载: pip install -e ".[download]"
 download = ["huggingface_hub[cli]"]
+# 服务层 CPU stub / ASGI / OpenAI Python Client 测试: pip install -e ".[test]"
+test = ["httpx", "pytest", "openai"]
+
+[project.scripts]
+nanoserve = "nanoserve.server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["nanovllm*"]
+include = ["nanovllm*", "nanoserve*"]
