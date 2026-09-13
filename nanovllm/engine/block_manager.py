@@ -31,6 +31,14 @@ class BlockManager:
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+        # prefix 统计属于物理 KV 账本；调用方可在请求首次 lookup 时关闭重复
+        # 记录，避免 chunk/retry 把一次请求放大成多次 lookup。
+        self.prefix_cache_lookups = 0
+        self.prefix_cache_hits = 0
+        self.prefix_cache_misses = 0
+        self.prefix_cache_capacity_failures = 0
+        self.prefix_cache_hit_blocks = 0
+        self._prefix_lookup_seq_ids: set[int] = set()
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -86,6 +94,37 @@ class BlockManager:
         if len(self.free_block_ids) < num_new_blocks:
             return -1
         return num_cached_blocks
+
+    def record_prefix_lookup(self, result: int, seq_id: int | None = None):
+        """记录一次请求级 prefix lookup 的结果。
+
+        ``-1`` 是物理容量不足，不是 cache miss；传入 seq_id 时由本层去重，
+        使直接使用 BlockManager 的调用方也不会因 chunk/retry 放大计数。
+        """
+        if seq_id is not None:
+            if seq_id in self._prefix_lookup_seq_ids:
+                return
+            self._prefix_lookup_seq_ids.add(seq_id)
+        self.prefix_cache_lookups += 1
+        if result == -1:
+            self.prefix_cache_capacity_failures += 1
+        elif result > 0:
+            self.prefix_cache_hits += 1
+            self.prefix_cache_hit_blocks += result
+        else:
+            self.prefix_cache_misses += 1
+
+    def prefix_cache_snapshot(self) -> dict:
+        """返回 prefix 统计的标量副本；不暴露 hash 映射或 block 对象。"""
+        lookups = self.prefix_cache_lookups
+        return {
+            "prefix_cache_lookups": lookups,
+            "prefix_cache_hits": self.prefix_cache_hits,
+            "prefix_cache_misses": self.prefix_cache_misses,
+            "prefix_cache_capacity_failures": self.prefix_cache_capacity_failures,
+            "prefix_cache_hit_blocks": self.prefix_cache_hit_blocks,
+            "prefix_cache_hit_rate": self.prefix_cache_hits / lookups if lookups else 0.0,
+        }
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         """为请求分配 KV；验证和实际记账失败时恢复完整账本快照。"""

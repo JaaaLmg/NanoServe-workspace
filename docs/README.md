@@ -1,6 +1,6 @@
 # NanoServe 文档索引
 
-按 `plan.md` 的 20 天计划组织，当前实现与验收覆盖 **Day 1–10 与 Day 11–12**（Day11–12 OpenAI 兼容 HTTP API 已在 `feature/openai-api-day11-12` 分支完成实现，并通过 CPU/ASGI 与 TP=1 eager 最小 GPU HTTP 验收；完整生产边界仍部分覆盖，详见 `day11-12-validation.md` 与 `day11-12-review.md`；SSE/断连检测留给 Day13）。Day 9 已完成实现与验收；Day 10 已完成实现、代码审查与 CPU 验收，GPU 主流程证据沿用已有记录，详见 `day10-validation.md` 与 `day10-review.md`。Day7 已完成实现与验收，记录见 `day7-validation.md`；Day8 已在 `feature/chunked-prefill` 分支完成实现，验收记录见 `day8-validation.md`。
+按 `plan.md` 的 20 天计划组织，当前实现与验收覆盖 **Day 1–10、Day 11–12 与 Day 13–14**。Day13–14 已完成 SSE 流式输出、断连安全边界、TokenEvent、Prometheus 指标与结构化日志，并通过 CPU/ASGI 及 TP=1 eager 最小 GPU/TCP 验证；TP>1、CUDA Graph、高并发和长期压力等生产边界仍部分覆盖，详见 `day13-14-validation.md`。Day11–12 OpenAI 兼容 HTTP API 及其完整生产边界见 `day11-12-validation.md` 与 `day11-12-review.md`。Day 9 已完成实现与验收；Day 10 已完成实现、代码审查与 CPU 验收，GPU 主流程证据沿用已有记录，详见 `day10-validation.md` 与 `day10-review.md`。Day7 已完成实现与验收，记录见 `day7-validation.md`；Day8 已在 `feature/chunked-prefill` 分支完成实现，验收记录见 `day8-validation.md`。
 
 ## 按天索引
 
@@ -38,6 +38,9 @@
 - [Day 11–12 验收记录](./day11-12-validation.md)：实现范围、修复后的 CPU 117 项服务测试与全量 495 项回归（含 `python -O`）、CPU ASGI 18 项与 GPU RTX 4090 D TP=1 eager 严格 HTTP 8 项验收；区分脚本证据、手工观察和未覆盖生产边界，原始 JSONL 位于 `docs/evidence/day11-12/`。
 - [Day 11–12 实现审查](./day11-12-review.md)：对照设计文档复核服务、worker、完成记录、上下文校验、并发/关闭生命周期和验收脚本；记录修复项、代码简化建议及 TP>1、CUDA Graph、SSE/断连、GPU 504 和长期压力等未覆盖边界。
 - [Day 11–12 教程](./day11-12-tutorial.md)：面向初学者讲解 HTTP 到 Engine 的完整请求链路、统一 InternalRequest、chat template、完成记录、单 worker 批处理、Future/取消/关闭、测试方法、典型缺陷和后续 Day13/14 衔接。
+- [Day 13–14 SSE 与可观测性设计](./sse-observability-day13-14.md)：合并规划 SSE 首/增量/finish/[DONE]、客户端断连与 KV 清理、独立 TokenEvent、Prometheus 指标、请求级结构化日志、测试矩阵和 CPU/TCP/GPU 验收方案；设计基线与实现结果分别以本文和 [验收记录](./day13-14-validation.md) 为准。
+- [Day 13–14 验收记录](./day13-14-validation.md)：记录 SSE、断连、Prometheus 指标、结构化日志的实际测试命令、结果、CPU/模型/GPU 可用性与未覆盖边界。
+- [Day 13–14 教程](./day13-14-tutorial.md)：面向初学者讲解从非流式 API 到 TokenEvent/SSE、断连安全点、KV/prefix 账本、Prometheus 指标、结构化日志、测试分层和常见并发问题。
 
 ## 其他
 

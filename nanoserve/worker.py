@@ -30,7 +30,8 @@ from time import perf_counter
 from typing import Callable, NamedTuple
 
 from nanoserve.service import (APIError, EngineError, InternalRequest,
-                               RequestManager, ServiceDrainingError)
+                               RequestManager, ServiceDrainingError,
+                               TokenEvent)
 
 logger = logging.getLogger(__name__)
 
@@ -185,7 +186,8 @@ class EngineWorker:
                     return
                 if self._engine.has_active_requests():
                     outputs, num_tokens = self._engine.step()
-                    # 每轮 step 后先消费完成/中止记录，再决定下一步
+                    # 增量必须先于终态记录进入 sink；否则最后一个 token
+                    # 可能排在 finish 后，客户端会看到乱序流。
                     self._consume_records()
                     if not outputs and num_tokens == 0 \
                             and self._engine.has_active_requests():
@@ -224,6 +226,14 @@ class EngineWorker:
             return
         request = command.request
         try:
+            # 断连先于 admission 时不再把请求送入 Engine，避免 cancel(False)
+            # 后出现“取消已发生但请求仍开始生成”的窗口。
+            if self._manager.is_cancel_requested(request.request_id):
+                self._manager.fail_request(
+                    request.request_id,
+                    lambda: ServiceDrainingError(
+                        "request disconnected before admission"))
+                return
             # InternalRequest.prompt_token_ids 是不可变 tuple（设计 §4.1）；
             # Engine 的 Sequence 会在生成过程中原地 append token，
             # 因此在 Engine 边界转换为 list
@@ -234,16 +244,30 @@ class EngineWorker:
             # 若 Engine 只返回 request_id，则完成记录的 seq_id 校验在
             # record 通道中退化为 request_id 校验，保持旧接口兼容。
             if isinstance(seq_id, int):
-                self._manager.bind_seq_id(request.request_id, seq_id)
+                bound = self._manager.bind_seq_id(request.request_id, seq_id)
             else:
                 # LLMEngine 为兼容旧 API 返回 request_id；在 admission 后
                 # 立即读取一次内部 seq_id 仅用于世代绑定，不向服务层暴露 Sequence。
                 get_request = getattr(self._engine, "get_request", None)
                 admitted = get_request(request.request_id) \
                     if get_request is not None else None
-                if admitted is not None:
-                    self._manager.bind_seq_id(request.request_id,
-                                              admitted.seq_id)
+                bound = (self._manager.bind_seq_id(request.request_id,
+                                                    admitted.seq_id)
+                         if admitted is not None else False)
+            if not bound:
+                self._manager.fail_request(
+                    request.request_id,
+                    lambda: EngineError("engine did not provide request identity"))
+                try:
+                    self._engine.cancel_request(request.request_id,
+                                                reason="engine_error")
+                except BaseException:
+                    pass
+                return
+            # admission 与断连可能并发：add/bind 完成后再次检查取消标志，
+            # 仍只通过 Engine cancel 入口处理，不直接触碰底层资源。
+            if self._manager.is_cancel_requested(request.request_id):
+                self.cancel(request.request_id, reason="client_disconnected")
         except BaseException as exc:
             logger.error("add_request 失败: request_id=%s, %s: %s",
                          request.request_id, type(exc).__name__, exc)
@@ -253,11 +277,40 @@ class EngineWorker:
                     "request rejected by engine before scheduling"))
 
     def _consume_records(self) -> None:
-        """消费完成/中止记录并交给 RequestManager 收口（幂等 drain）。
-
-        每条记录隔离异常：单条损坏记录不能阻止后续记录被消费，也不能让
-        其他 HTTP Future 永久悬挂；RequestManager 自身负责为该记录收口。
-        """
+        """按 token → completed → aborted 固定顺序排出控制面记录。"""
+        pop_events = getattr(self._engine, "pop_token_events", None)
+        if pop_events is not None:
+            try:
+                token_events = pop_events()
+            except BaseException as exc:
+                logger.error("读取 token 事件失败: %s: %s", type(exc).__name__, exc)
+                token_events = []
+            for event in token_events:
+                try:
+                    if not isinstance(event, TokenEvent):
+                        # 兼容底层 dataclass 版本差异：以字段契约适配 DTO。
+                        event = TokenEvent(
+                            seq_id=event.seq_id, request_id=event.request_id,
+                            round_id=event.round_id, token_ids=tuple(event.token_ids),
+                            completion_index=event.completion_index,
+                            emitted_at=event.emitted_at,
+                            is_first_token=event.is_first_token,
+                            is_final=getattr(event, "is_final", False),
+                            finish_reason=getattr(event, "finish_reason", None),
+                            phase=getattr(event, "phase", "decode"))
+                    event_status = self._manager.resolve_token_event_status(event)
+                    if event_status != "accepted":
+                        # 未知/迟到/序号错误世代只能丢弃；只有当前句柄明确
+                        # 报告背压时才取消，避免旧事件按 request_id 误伤新请求。
+                        logger.warning("token event 未被流句柄接收: request_id=%s seq_id=%s status=%s",
+                                       event.request_id, event.seq_id, event_status)
+                        if event_status == "backpressure":
+                            self.cancel(event.request_id, reason="stream_backpressure")
+                except BaseException as exc:
+                    logger.error("token 事件消费失败: %s: %s", type(exc).__name__, exc)
+                    self._manager.fail_request(
+                        getattr(event, "request_id", ""),
+                        lambda: EngineError("failed to consume token event"))
         try:
             completed = self._engine.pop_completed()
         except BaseException as exc:

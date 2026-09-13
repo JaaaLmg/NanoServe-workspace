@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import threading
 from collections import deque
 from dataclasses import dataclass
@@ -9,10 +10,35 @@ from nanovllm.config import Config, validate_positive_int
 from nanovllm.engine.sequence import (InvalidStateTransition, Sequence,
                                       SequenceStatus)
 from nanovllm.engine.block_manager import BlockManager
-from nanovllm.engine.completed_request import AbortedRequest, CompletedRequest
+from nanovllm.engine.completed_request import AbortedRequest, CompletedRequest, TokenEvent
 
 # 模块级 logger：库代码不做 basicConfig，日志开关由调用方（验收脚本/服务层）控制
 logger = logging.getLogger(__name__)
+
+# TokenEvent 只属于 rank 0 控制面。默认容量必须是有限值，不能用无界 deque
+# 掩盖消费端失速；测试和直接构造 Config 的调用方可通过同名字段覆盖。
+DEFAULT_TOKEN_EVENT_QUEUE_SIZE = 1024
+
+
+class TokenEventBackpressureError(RuntimeError):
+    """TokenEvent 队列已满，拒绝静默丢弃本次采样结果。
+
+    异常在追加 completion token 之前抛出，因此本次 token 不会进入 Sequence，
+    随后的 Engine step 事务会把请求收敛为 AbortedRequest 并释放 KV；已有队列
+    内容仍可由调用方 drain，不能为了塞入新事件而覆盖旧 token。
+    """
+
+    def __init__(self, *, seq_id: int, request_id: str, capacity: int,
+                 pending: int):
+        self.seq_id = seq_id
+        self.request_id = request_id
+        self.capacity = capacity
+        self.pending = pending
+        super().__init__(
+            f"TokenEvent queue backpressure: request_id={request_id!r} "
+            f"seq_id={seq_id}, pending={pending}, capacity={capacity}; "
+            "sample was not committed")
+
 
 # ---------- 本轮决策原因（§5.1 原因分类：不把所有等待都算 budget） ----------
 # Day9 混合轮归因重构：phase_priority（"整轮被另一阶段占用"）随 decode-first
@@ -143,6 +169,17 @@ class Scheduler:
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        # TokenEvent 是控制面旁路，但仍必须有界。使用配置字段优先、环境变量
+        # 次之、固定默认值兜底；put_nowait 失败时由 step 事务报明确背压错误，
+        # 绝不等待消费者，也绝不先追加 token 后静默丢事件。
+        queue_size = getattr(config, "token_event_queue_size", None)
+        if queue_size is None:
+            queue_size = os.getenv("NANOSERVE_TOKEN_EVENT_QUEUE_SIZE")
+        if queue_size is None:
+            queue_size = DEFAULT_TOKEN_EVENT_QUEUE_SIZE
+        self.token_event_queue_size = validate_positive_int(
+            int(queue_size) if isinstance(queue_size, str) and queue_size.isdecimal()
+            else queue_size, "token_event_queue_size")
         # Day10 控制锁（§3.4）：保护控制面状态（cancel_requested/cancel_reason/
         # requests 索引/队列）与资源账本变更的线性化。request_cancel 信号入口与
         # schedule/postprocess 安全点都在锁内执行控制面读写；锁不跨越 GPU forward
@@ -171,6 +208,20 @@ class Scheduler:
         # 历史请求数为上界，且只保留 completion token 计数级的小对象。
         self.completed_records: deque[CompletedRequest] = deque()
         self.aborted_records: deque[AbortedRequest] = deque()
+        # TokenEvent 与终态记录分离：事件在 token 成功追加后入队，终态记录仍
+        # 只由 _finalize 产生。deque 不使用 maxlen（maxlen 会静默淘汰最旧 token）；
+        # 由 _enqueue_token_event 在锁内显式执行容量检查，满时抛出明确背压错误。
+        self.token_events: deque[TokenEvent] = deque()
+        self.token_event_backpressure_total = 0
+
+        # prefix lookup 统计只在每个请求首次 can_allocate 查询时计数；chunk/retry
+        # 重试不会放大请求级分母，-1（容量失败）单独归类而非 miss。
+        self._prefix_lookup_seq_ids: set[int] = set()
+        self.prefix_cache_lookups = 0
+        self.prefix_cache_hits = 0
+        self.prefix_cache_misses = 0
+        self.prefix_cache_capacity_failures = 0
+        self.prefix_cache_hit_blocks = 0
 
         # ---------- Day7：轮次与预算等待统计（rank 0 内部字段，不进 TP payload） ----------
         # 每次 schedule 自增的单调轮次 ID；空轮也分配，不用外部 ID 充当轮次 ID
@@ -295,6 +346,7 @@ class Scheduler:
         self._active_request_ids.discard(seq.request_id)
         # Day8 chunk 计数随请求终态回收（seq_id 全局唯一，记录不会误伤新请求）
         self._prefill_chunk_count.pop(seq.seq_id, None)
+        self._prefix_lookup_seq_ids.discard(seq.seq_id)
         # 终态预算收尾：结算未关闭 episode、发终态等待摘要并删除记录
         self._settle_terminal_budget_stats(seq, now)
 
@@ -596,15 +648,93 @@ class Scheduler:
 
     # ---------- Day10 异常收尾（§4.2.3/§4.3） ----------
 
+    def resource_snapshot(self) -> dict:
+        """返回控制锁内构造的只读资源快照。
+
+        running 的口径严格按 SequenceStatus.RUNNING，而不是按队列长度；这样
+        即使调用方正在收口终态，快照也不会把 WAITING/PREEMPTED 误报为运行中。
+        返回新建的标量字典，不暴露 Sequence、队列或 block table。
+        """
+        with self._control_lock:
+            active = sum(not seq.is_terminal for seq in self.requests.values())
+            running = sum(seq.status is SequenceStatus.RUNNING
+                          for seq in self.requests.values())
+            waiting = sum(seq.status is SequenceStatus.WAITING
+                          for seq in self.requests.values())
+            paused = sum(seq.status is SequenceStatus.PREEMPTED
+                         for seq in self.requests.values())
+            total = len(self.block_manager.blocks)
+            used = len(self.block_manager.used_block_ids)
+            return {
+                "active": active,
+                "active_requests": active,
+                "waiting": waiting,
+                "paused": paused,
+                "running": running,
+                "running_requests": running,
+                "free": total - used,
+                "free_blocks": total - used,
+                "used": used,
+                "used_blocks": used,
+                "total": total,
+                "total_blocks": total,
+                "kv_cache_utilization": used / total if total else 0.0,
+                "prefix_cache_lookups": self.prefix_cache_lookups,
+                "prefix_cache_hits": self.prefix_cache_hits,
+                "prefix_cache_misses": self.prefix_cache_misses,
+                "prefix_cache_capacity_failures": self.prefix_cache_capacity_failures,
+                "prefix_cache_hit_blocks": self.prefix_cache_hit_blocks,
+                "prefix_cache_hit_rate": (
+                    self.prefix_cache_hits / self.prefix_cache_lookups
+                    if self.prefix_cache_lookups else 0.0),
+                "token_event_queue_size": self.token_event_queue_size,
+                "token_event_queue_depth": len(self.token_events),
+                "token_event_backpressure_total": self.token_event_backpressure_total,
+            }
+
     def _resource_snapshot(self) -> dict:
-        """资源快照：活动请求/队列/账本计数，供异常收尾日志与验收交叉核对。"""
-        return {
-            "active_requests": len(self.requests),
-            "waiting": len(self.waiting),
-            "running": len(self.running),
-            "free_blocks": len(self.block_manager.free_block_ids),
-            "used_blocks": len(self.block_manager.used_block_ids),
-        }
+        """兼容旧内部调用的资源快照别名。"""
+        return self.resource_snapshot()
+
+    def pop_token_events(self) -> list[TokenEvent]:
+        """排出并清空 token 事件；重复调用返回空列表。"""
+        with self._control_lock:
+            events = list(self.token_events)
+            self.token_events.clear()
+            return events
+
+    def _ensure_token_event_capacity(self, event: TokenEvent) -> None:
+        """无阻塞地预留本次事件的容量，容量不足时显式失败。
+
+        该检查与 postprocess 处于同一控制锁内；通过先检查、后追加 token、再
+        入队，保证异常路径既不会静默丢事件，也不会留下“事件已发但 token 未
+        提交”的半成功状态。异常由 Engine step 事务统一收口并释放 KV。
+        """
+        if len(self.token_events) >= self.token_event_queue_size:
+            self.token_event_backpressure_total += 1
+            raise TokenEventBackpressureError(
+                seq_id=event.seq_id, request_id=event.request_id,
+                capacity=self.token_event_queue_size, pending=len(self.token_events))
+
+    def _enqueue_token_event(self, event: TokenEvent) -> None:
+        """在容量已检查后入队；此操作永不等待且不会淘汰旧事件。"""
+        self._ensure_token_event_capacity(event)
+        self.token_events.append(event)
+
+    def _record_prefix_lookup(self, seq: Sequence, num_cached_blocks: int):
+        """按请求世代只记录首次 lookup，避免 chunk/retry 重复放大统计。"""
+        if seq.seq_id in self._prefix_lookup_seq_ids:
+            return
+        self._prefix_lookup_seq_ids.add(seq.seq_id)
+        self.prefix_cache_lookups += 1
+        self.block_manager.record_prefix_lookup(num_cached_blocks)
+        if num_cached_blocks == -1:
+            self.prefix_cache_capacity_failures += 1
+        elif num_cached_blocks > 0:
+            self.prefix_cache_hits += 1
+            self.prefix_cache_hit_blocks += num_cached_blocks
+        else:
+            self.prefix_cache_misses += 1
 
     def _abort_one(self, seq: Sequence, reason: str, now: float):
         """单个对象的异常收尾（幂等，可重入）：活动则迁移 CANCELLED 再统一 _finalize。
@@ -779,6 +909,7 @@ class Scheduler:
         """
         if not seq.block_table:
             num_cached_blocks = self.block_manager.can_allocate(seq)
+            self._record_prefix_lookup(seq, num_cached_blocks)
             if num_cached_blocks == -1:
                 return 0, None
             return num_cached_blocks, seq.num_tokens - num_cached_blocks * self.block_size
@@ -1342,10 +1473,29 @@ class Scheduler:
                 # 中间 chunk：丢弃采样结果，保持 WAITING，下一轮延续进度
                 # （阶段分支由 item.phase 决定，替代 Day8 的全批 is_prefill）
                 continue
-            # 最后 chunk（或 decode item）：追加采样的首 completion；
+            # 最后 chunk（或 decode item）：先追加真实 completion token，再在
+            # mark_finished/_finalize 前发布事件。completion_index 必须取 append
+            # 前的计数，避免首 token 被错误标成 1；中间 prefill 在上方 continue，
+            # 因而永远不会进入此事件通道。
+            completion_index = seq.num_completion_tokens
+            # 先尝试把事件放入有界控制面队列，再提交 token。队列满时抛出
+            # TokenEventBackpressureError，Engine 事务会清理活动请求；不能先
+            # 改 Sequence 再丢事件，否则流端无法恢复完整 token 序列。
+            token_event = TokenEvent(
+                seq_id=seq.seq_id,
+                request_id=seq.request_id,
+                round_id=it.round_id,
+                token_ids=(token_id,),
+                completion_index=completion_index,
+                emitted_at=now,
+                is_first_token=completion_index == 0,
+                phase=it.phase,
+            )
+            self._ensure_token_event_capacity(token_event)
+            seq.append_token(token_id)
+            self._enqueue_token_event(token_event)
             # 完成判定：EOS 触发记为 stop，达到 max_tokens 记为 length；
             # mark_finished 幂等，配合 _finalize 保证不 double free
-            seq.append_token(token_id)
             if not seq.ignore_eos and token_id == self.eos:
                 seq.mark_finished("stop")
                 self._finalize(seq, now)

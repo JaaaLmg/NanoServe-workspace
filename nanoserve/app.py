@@ -27,6 +27,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from nanoserve import api
+from nanoserve.observability import Observability
 from nanoserve.config import ServerConfig
 from nanoserve.service import APIError, EngineError, RequestManager
 from nanoserve.worker import EngineWorker
@@ -92,10 +93,11 @@ class ServiceState:
         self.max_request_seconds: float | None = None
         # /v1/models 的 created 时间戳：进程内稳定
         self.created_at = int(time.time())
+        self.observability = None
 
     def configure(self, *, model_id: str, tokenizer, manager: RequestManager,
                   worker, engine, server_config: ServerConfig,
-                  max_model_len: int) -> None:
+                  max_model_len: int, observability=None) -> None:
         with self._lock:
             self.model_id = model_id
             self.tokenizer = tokenizer
@@ -105,6 +107,7 @@ class ServiceState:
             self.server_config = server_config
             self.max_request_seconds = server_config.max_request_seconds
             self.max_model_len = max_model_len
+            self.observability = observability
 
     def mark_ready(self) -> None:
         with self._lock:
@@ -162,18 +165,20 @@ def create_app(engine_factory: Callable[[ServerConfig], EngineBundle] | None = N
         state = ServiceState()
         app.state.service = state
         engine = manager = worker = None
+        observer = Observability()
         try:
             config = server_config or ServerConfig.from_env()
             bundle = factory(config)
             engine = bundle.engine
-            manager = RequestManager(bundle.tokenizer)
+            manager = RequestManager(bundle.tokenizer, observer=observer)
             worker = EngineWorker(engine, manager)
             manager.attach_worker(worker)
             state.configure(model_id=config.public_model_id,
                             tokenizer=bundle.tokenizer, manager=manager,
                             worker=worker, engine=engine,
                             server_config=config,
-                            max_model_len=bundle.max_model_len)
+                            max_model_len=bundle.max_model_len,
+                            observability=observer)
             worker.start()
             state.mark_ready()
             logger.info("NanoServe 就绪: model_id=%s, max_model_len=%d, "
@@ -225,10 +230,37 @@ def create_app(engine_factory: Callable[[ServerConfig], EngineBundle] | None = N
                   version="0.1.0", lifespan=lifespan)
     app.include_router(api.router)
 
+    @app.get("/metrics")
+    async def metrics(request: Request):
+        service = request.app.state.service
+        observer = getattr(service, "observability", None)
+        if observer is None:
+            return JSONResponse(status_code=503,
+                                content={"error": {"message": "metrics unavailable"}})
+        # 只读取 Engine 提供的公开标量快照，不触碰 Scheduler 私有对象。
+        try:
+            snapshot = service.engine.resource_snapshot()
+            observer.refresh_resource_snapshot(snapshot)
+        except Exception:
+            # metrics 是旁路能力；Engine 快照失败不能影响抓取或请求处理。
+            pass
+        from fastapi.responses import Response
+        return Response(content=observer.render_metrics(),
+                        media_type="text/plain; version=0.0.4")
+
     # ---------- 统一异常处理（§3.5：同一输入错误不因分支不同而协议不一致） ----------
 
     @app.exception_handler(APIError)
     async def api_error_handler(request: Request, exc: APIError):
+        service = getattr(request.app.state, "service", None)
+        observer = getattr(service, "observability", None)
+        if observer is not None:
+            try:
+                observer.emit("request_rejected",
+                              request_id=exc.request_id,
+                              stage="service", error_code=exc.code)
+            except Exception:
+                pass
         return api._error_response(exc)
 
     @app.exception_handler(RequestValidationError)
@@ -243,6 +275,13 @@ def create_app(engine_factory: Callable[[ServerConfig], EngineBundle] | None = N
         error = InvalidRequestShim(
             f"invalid value for field {loc!r}: {first.get('type', 'invalid')}",
             param=loc)
+        try:
+            observer = getattr(request.app.state.service, "observability", None)
+            if observer is not None:
+                observer.emit("request_rejected", stage="validation",
+                              error_code=error.code)
+        except Exception:
+            pass
         return api._error_response(error)
 
     @app.exception_handler(Exception)

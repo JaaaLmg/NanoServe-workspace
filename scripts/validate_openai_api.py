@@ -182,7 +182,7 @@ def run_cpu_mode(records: list[dict]) -> int:
         check("sampling_params_consistent", params_ok, resp=resp_c)
 
         # 6) 错误路径：非法 role / 空 messages / 上下文超限 / 模型不匹配 /
-        #    stream=true
+        #    与 SSE stream=true 冒烟
         resp = client.post("/v1/chat/completions", json={
             "model": MODEL_ID,
             "messages": [{"role": "tool", "content": "x"}]})
@@ -205,16 +205,19 @@ def run_cpu_mode(records: list[dict]) -> int:
               error_code=error_code_of(resp))
         for route, payload in [
             ("/v1/completions", {"model": MODEL_ID, "prompt": "x",
-                                 "stream": True}),
+                                 "max_tokens": 2, "stream": True}),
             ("/v1/chat/completions", {"model": MODEL_ID,
                                        "messages": [{"role": "user",
                                                      "content": "x"}],
-                                       "stream": True}),
+                                       "max_tokens": 2, "stream": True}),
         ]:
             resp = client.post(route, json=payload)
-            check("error_stream_501", resp.status_code == 501
-                  and error_code_of(resp) == "stream_not_implemented",
-                  resp=resp, error_code=error_code_of(resp))
+            stream_ok = (resp.status_code == 200
+                          and resp.headers.get("content-type", "").startswith(
+                              "text/event-stream")
+                          and "data: [DONE]" in resp.text)
+            check("stream_sse_smoke", stream_ok, resp=resp,
+                  error_code=error_code_of(resp))
 
         # 7) 并发请求：多个 HTTP 等待者同时提交，结果必须按各自 response
         # body 关联；FakeEngine 的 step 仍只能由一个 worker 线程驱动。

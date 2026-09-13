@@ -14,11 +14,10 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
-from nanovllm.engine.completed_request import AbortedRequest, CompletedRequest
+from nanovllm.engine.completed_request import AbortedRequest, CompletedRequest, TokenEvent
 
-# 模块重导出：服务层（Day11+）只依赖 LLMEngine 与这两类只读记录，
-# 不需要感知 Scheduler 内部结构
-__all__ = ["LLMEngine", "CompletedRequest", "AbortedRequest"]
+# 模块重导出：服务层只依赖 Engine 与不可变控制面记录，不感知 Scheduler 私有结构
+__all__ = ["LLMEngine", "CompletedRequest", "AbortedRequest", "TokenEvent"]
 
 # Engine 侧结构化日志：与 Scheduler 共用调用方控制的日志配置，库内不做 basicConfig
 logger = logging.getLogger(__name__)
@@ -136,6 +135,14 @@ class LLMEngine:
         不能连续空转 step。
         """
         return bool(self.scheduler.requests)
+
+    def pop_token_events(self) -> list[TokenEvent]:
+        """排出并清空真实增量 token 事件（幂等 drain）。"""
+        return self.scheduler.pop_token_events()
+
+    def resource_snapshot(self) -> dict:
+        """返回 Scheduler 的不可变标量资源快照，不暴露底层可写对象。"""
+        return self.scheduler.resource_snapshot()
 
     def pop_completed(self) -> list[CompletedRequest]:
         """排出并清空正常完成记录（Day11–12 完成记录通道）。
@@ -422,6 +429,7 @@ class LLMEngine:
             output, num_tokens = self.step()
             # 离线 generate() 仍以 step() 返回值为结果来源；同时排出服务层
             # 完成记录，避免长期离线调用让控制面 deque 无界增长。
+            self.pop_token_events()
             self.pop_completed()
             self.pop_aborted()
             if not output and num_tokens == 0 and not self.is_finished():

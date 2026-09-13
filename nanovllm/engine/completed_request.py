@@ -21,6 +21,28 @@ from typing import Literal
 
 
 @dataclass(frozen=True, slots=True)
+class TokenEvent:
+    """一次真实 completion token 的不可变增量记录。
+
+    ``completion_index`` 在 token 追加前采样，因此首 token 恒为 0；事件只
+    属于 rank 0 控制面，不进入张量并行模型 payload。``emitted_at`` 与请求
+    生命周期其余时间点共用 perf_counter 时间域。
+    """
+
+    seq_id: int
+    request_id: str
+    round_id: int
+    token_ids: tuple[int, ...]
+    completion_index: int
+    emitted_at: float
+    is_first_token: bool
+    is_final: bool = False
+    finish_reason: str | None = None
+    # 记录真实执行阶段，供服务层日志区分最后一个 prefill chunk 与 decode。
+    phase: str = "decode"
+
+
+@dataclass(frozen=True, slots=True)
 class CompletedRequest:
     """一次正常完成的只读记录（FINISHED 迁移与 _finalize 清理之间捕获）。"""
 

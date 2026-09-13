@@ -15,17 +15,39 @@ concurrent.futures.Future；worker 线程负责 resolve/fail，天然 loop-safe�
 """
 
 import logging
+import os
+import queue
 import threading
 import uuid
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from time import perf_counter
-from typing import Callable, Literal
+from typing import Callable, Iterator, Literal
 
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.completed_request import AbortedRequest, CompletedRequest
+
+try:  # 底层 Day13 DTO 可先后落地；服务层对旧版本保持可导入。
+    from nanovllm.engine.completed_request import TokenEvent
+except ImportError:  # pragma: no cover - 被底层实现覆盖时不走此兼容分支
+    @dataclass(frozen=True, slots=True)
+    class TokenEvent:
+        seq_id: int
+        request_id: str
+        round_id: int
+        token_ids: tuple[int, ...]
+        completion_index: int
+        emitted_at: float
+        is_first_token: bool
+        is_final: bool = False
+        finish_reason: str | None = None
 from nanoserve.schemas import (ChatCompletionRequest, CompletionRequest,
                                DEFAULT_MAX_TOKENS)
+try:
+    from nanoserve.observability import Observability, RequestTimeline
+except ImportError:  # pragma: no cover - keeps low-level service imports lightweight
+    Observability = object
+    RequestTimeline = object
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +182,174 @@ class RequestHandle:
     # 与 seq_id，防止旧轮次迟到记录完成同 ID 复用的新句柄。
     seq_id: int | None = None
     future: Future = field(default_factory=Future)
+    stream: "StreamHandle | None" = None
+    admitted_at: float | None = None
+    first_token_at: float | None = None
+    last_token_at: float | None = None
+    timeline: object | None = None
+    next_completion_index: int = 0
+    deadline: float | None = None
+
+
+class StreamBackpressureError(APIError):
+    """流客户端消费太慢；失败该流而不是让 Engine 线程阻塞。"""
+
+    status_code = 503
+    error_type = "service_error"
+    code = "stream_backpressure"
+
+
+@dataclass(frozen=True, slots=True)
+class StreamTerminal:
+    """有界流的终态 envelope；正常值为 CompletedRequest，异常值为 APIError。"""
+
+    record: object | None = None
+    error: BaseException | None = None
+
+
+class StreamHandle:
+    """独立、有界、线程安全的事件 sink。
+
+    publish 永不等待：队列满即以 stream_backpressure 收口。终态 envelope
+    按 FIFO 写入，保证已有 token 先于 finish；close/cancel 重复调用无副作用。
+    """
+
+    def __init__(self, request_id: str, kind: InternalKind, created_at: float,
+                 *, maxsize: int | None = None):
+        size = maxsize if maxsize is not None else int(
+            os.getenv("NANOSERVE_STREAM_EVENT_QUEUE_SIZE", "16"))
+        if size <= 0:
+            raise ValueError("stream event queue size must be positive")
+        self.request_id, self.kind, self.created_at = request_id, kind, created_at
+        self.seq_id: int | None = None
+        self._queue: queue.Queue = queue.Queue(maxsize=size)
+        self._lock = threading.Lock()
+        self._closed = False
+        self._terminal: StreamTerminal | None = None
+        # admission 与首个输出分别通知：路由返回 StreamingResponse 前要先
+        # 给 add/首轮 step 一个有限观察窗口，避免错误已经发生却先发 200 首帧。
+        self._ready = threading.Event()
+        self._output_ready = threading.Event()
+        self._error: BaseException | None = None
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    @property
+    def maxsize(self) -> int:
+        return self._queue.maxsize
+
+    @property
+    def terminal_error(self) -> BaseException | None:
+        with self._lock:
+            return self._error
+
+    @property
+    def terminal_record(self):
+        with self._lock:
+            return (self._terminal.record if self._terminal is not None
+                    else None)
+
+    def bind_seq_id(self, seq_id: int) -> bool:
+        with self._lock:
+            if self.seq_id is not None:
+                return self.seq_id == seq_id
+            self.seq_id = seq_id
+            self._ready.set()
+            return True
+
+    def wait_admission(self, timeout: float = 5.0) -> bool:
+        """等待 admission 或首个终态；用于首 SSE frame 前暴露提交错误。"""
+        if self._ready.wait(timeout=max(0.0, timeout)):
+            return True
+        with self._lock:
+            return self.seq_id is not None or self._terminal is not None
+
+    def publish(self, event: TokenEvent) -> bool:
+        """非阻塞写入 token；失败时立即终止该 sink。"""
+        with self._lock:
+            if self._closed:
+                return False
+            try:
+                self._queue.put_nowait(event)
+                self._output_ready.set()
+                return True
+            except queue.Full:
+                pass
+        self.fail(StreamBackpressureError(
+            "stream consumer is too slow; request cancelled"))
+        return False
+
+    def finish(self, record: CompletedRequest) -> bool:
+        return self._put_terminal(StreamTerminal(record=record))
+
+    def abort(self, record: AbortedRequest) -> bool:
+        return self._put_terminal(StreamTerminal(record=record))
+
+    def fail(self, error: BaseException) -> bool:
+        return self._put_terminal(StreamTerminal(error=error))
+
+    # Explicit aliases make the sink usable by sync and async protocol adapters
+    # without exposing its internal queue.
+    publish_token = publish
+
+    def _put_terminal(self, terminal: StreamTerminal) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            # 终态必须排在所有已发布 token 后面；队列满时不能丢 token
+            # 再伪造成功 finish，改为保留错误终态并让消费者先排空。
+            if self._queue.full():
+                self._closed = False
+                self._error = StreamBackpressureError(
+                    "stream consumer is too slow; request cancelled")
+                self._terminal = StreamTerminal(error=self._error)
+                self._closed = True
+                self._ready.set()
+                self._output_ready.set()
+                return False
+            self._closed = True
+            self._terminal = terminal
+            self._error = terminal.error
+            self._queue.put_nowait(terminal)
+            self._ready.set()
+            self._output_ready.set()
+            return True
+
+    def next_event(self, timeout: float | None = None):
+        """有限等待取得 token 或终态；终态缓存后可安全重复读取。"""
+        try:
+            item = self._queue.get(timeout=timeout)
+        except queue.Empty:
+            with self._lock:
+                terminal = self._terminal
+            if terminal is None:
+                raise TimeoutError("timed out waiting for stream event")
+            item = terminal
+        if isinstance(item, StreamTerminal):
+            with self._lock:
+                self._terminal = item
+            if item.error is not None:
+                raise item.error
+            return item.record
+        return item
+
+    def get(self, timeout: float | None = None):
+        return self.next_event(timeout)
+
+    receive = next_event
+
+    def iter_events(self, timeout: float = 1.0) -> Iterator:
+        while True:
+            item = self.next_event(timeout)
+            if isinstance(item, (CompletedRequest, AbortedRequest)):
+                return
+            yield item
+
+    def close(self, error: BaseException | None = None) -> bool:
+        return self.fail(error or ServiceDrainingError("stream closed"))
 
 
 # ============================== 请求构建（唯一转换路径） ==============================
@@ -324,9 +514,12 @@ class RequestManager:
     - stop_accepting：优雅关闭第一步，之后 submit 抛 ServiceDrainingError。
     """
 
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, observer=None):
         # 文本解码必须使用与 Engine 编码相同的 tokenizer（app 启动时注入）
         self._tokenizer = tokenizer
+        # 观测器是旁路依赖；None 保持 Day11–12 直接构造 RequestManager 的兼容性。
+        self._observer = observer
+        self._cancel_requested: dict[str, str] = {}
         # pending 同时被 HTTP 线程和 worker/关闭线程访问；即使 CPython 的
         # 单次 dict 操作受 GIL 保护，也不能用它替代跨操作的一致性锁。
         self._pending: dict[str, RequestHandle] = {}
@@ -340,8 +533,13 @@ class RequestManager:
 
     # ---------- HTTP 线程侧 ----------
 
-    def submit(self, request: InternalRequest) -> RequestHandle:
-        """登记句柄并排队到 worker；停止接收后抛 ServiceDrainingError。"""
+    def submit(self, request: InternalRequest, *, stream: bool = False,
+               stream_queue_size: int | None = None):
+        """登记句柄并排队到 worker；停止接收后抛 ServiceDrainingError。
+
+        stream=True 时先创建独立 sink 再入队，避免 submit 与 worker admission
+        之间出现无法交付事件的窗口；默认路径仍返回原 RequestHandle。
+        """
         # 登记和命令入队必须在同一临界区完成；shutdown 只能在线性化点
         # 之前或之后发生，不能把已登记但未入队的 Future 留给无人消费。
         with self._lock:
@@ -354,9 +552,27 @@ class RequestManager:
                 # 服务层 uuid 生成的 ID 不应冲突；命中即为编程错误，尽早失败
                 raise EngineError("duplicate active request id",
                                   request_id=request.request_id)
+            stream_handle = StreamHandle(
+                request.request_id, request.kind, request.created_at,
+                maxsize=stream_queue_size) if stream else None
             handle = RequestHandle(request_id=request.request_id,
                                    kind=request.kind,
-                                   created_at=request.created_at)
+                                   created_at=request.created_at,
+                                   stream=stream_handle,
+                                   deadline=request.deadline)
+            if self._observer is not None:
+                try:
+                    handle.timeline = self._observer.start_request(
+                        request.request_id, kind=request.kind,
+                        prompt_tokens=len(request.prompt_token_ids))
+                    handle.timeline.mark_submitted(request.created_at)
+                    self._observer.emit("request_submitted",
+                                       request_id=request.request_id,
+                                       kind=request.kind,
+                                       observed_at=request.created_at,
+                                       queue_origin="http")
+                except Exception:
+                    handle.timeline = None
             self._pending[request.request_id] = handle
             try:
                 self._worker.submit(request)
@@ -366,9 +582,28 @@ class RequestManager:
                 raise
         return handle
 
-    def wait(self, handle: RequestHandle) -> CompletionResult:
-        """等待 worker 收口；失败以 APIError 子类异常透传给路由。"""
-        return handle.future.result()
+    def wait(self, handle: RequestHandle, timeout: float | None = None) -> CompletionResult:
+        """有限等待 worker 收口；超时通过统一取消入口终止请求。"""
+        if timeout is None:
+            if handle.deadline is not None:
+                timeout = max(0.0, handle.deadline - perf_counter())
+            else:
+                timeout = 30.0
+        try:
+            return handle.future.result(timeout=max(0.001, timeout))
+        except TimeoutError as exc:
+            self.cancel(handle.request_id, reason="timeout")
+            try:
+                return handle.future.result(timeout=1.0)
+            except TimeoutError:
+                # worker 无法在有限窗口收口时，先从 pending 移除并让调用者
+                # 得到明确 504；底层 worker 仍由自己的安全边界继续清理。
+                with self._lock:
+                    self._pending.pop(handle.request_id, None)
+                    self._cancel_requested.pop(handle.request_id, None)
+                raise RequestTimeoutError(
+                    "request exceeded its service wait deadline",
+                    request_id=handle.request_id) from exc
 
     def stop_accepting(self) -> None:
         """优雅关闭第一步：新请求一律 503（与 worker 退出线性化）。"""
@@ -379,12 +614,104 @@ class RequestManager:
 
     def bind_seq_id(self, request_id: str, seq_id: int) -> bool:
         """绑定 Engine admission 后的 seq_id，供迟到记录做世代校验。"""
+        admission_event = None
+        timeline = None
         with self._lock:
             handle = self._pending.get(request_id)
             if handle is None or handle.seq_id is not None:
                 return False
             handle.seq_id = seq_id
-            return True
+            handle.admitted_at = perf_counter()
+            if handle.stream is not None:
+                handle.stream.bind_seq_id(seq_id)
+            timeline = getattr(handle, "timeline", None)
+            if timeline is not None:
+                timeline.seq_id = seq_id
+                timeline.mark_admitted(handle.admitted_at)
+                admission_event = (request_id, seq_id, handle.kind,
+                                   handle.admitted_at)
+        # 日志/指标是旁路，不能在 manager 锁内执行可能调用用户 handler 的操作。
+        if timeline is not None and self._observer is not None:
+            try:
+                self._observer.emit("request_admitted",
+                                   request_id=admission_event[0],
+                                   seq_id=admission_event[1],
+                                   kind=admission_event[2],
+                                   observed_at=admission_event[3])
+                # admission 成功即记入 prompt token counter；终态收口只
+                # 负责延迟指标，避免长期运行请求在完成前漏计。
+                self._observer.record_timeline(timeline)
+            except Exception:
+                pass
+        return True
+
+    def stream_handle(self, request_id: str) -> StreamHandle | None:
+        with self._lock:
+            handle = self._pending.get(request_id)
+            return handle.stream if handle is not None else None
+
+    def resolve_token_event_status(self, event: TokenEvent) -> str:
+        """处理 token event 并返回 ``accepted/stale/invalid/backpressure`` 分类。"""
+        observer_event = None
+        with self._lock:
+            handle = self._pending.get(event.request_id)
+            if handle is None or handle.seq_id != event.seq_id:
+                logger.warning("忽略未知/迟到 token 事件: request_id=%s seq_id=%s",
+                               event.request_id, event.seq_id)
+                return "stale"
+            expected = handle.next_completion_index
+            if event.completion_index != expected or \
+                    event.is_first_token != (expected == 0):
+                logger.warning("忽略非连续 token 事件: request_id=%s seq_id=%s index=%s expected=%s",
+                               event.request_id, event.seq_id,
+                               event.completion_index, expected)
+                return "invalid"
+            handle.next_completion_index = expected + len(event.token_ids)
+            if handle.first_token_at is None and event.token_ids:
+                handle.first_token_at = event.emitted_at
+            if event.token_ids:
+                handle.last_token_at = event.emitted_at
+            timeline = getattr(handle, "timeline", None)
+            if timeline is not None and event.token_ids:
+                try:
+                    for _ in event.token_ids:
+                        timeline.mark_token(event.emitted_at)
+                    if self._observer is not None:
+                        self._observer.emit(
+                            "request_first_token" if event.is_first_token else "request_token",
+                            request_id=event.request_id, seq_id=event.seq_id,
+                            round_id=event.round_id, completion_index=event.completion_index,
+                            phase=getattr(event, "phase", "decode"),
+                            observed_at=event.emitted_at)
+                except Exception:
+                    pass
+            sink = handle.stream
+        # 非流式请求也要消费事件以记录指标，但不需要入队。
+        if sink is None:
+            return "accepted"
+        return "accepted" if sink.publish(event) else "backpressure"
+
+    def resolve_token_event(self, event: TokenEvent) -> bool:
+        return self.resolve_token_event_status(event) == "accepted"
+
+    def cancel(self, request_id: str, reason: str = "client_cancelled") -> bool:
+        """取消请求并覆盖尚未 admission 的窗口。"""
+        with self._lock:
+            handle = self._pending.get(request_id)
+            if handle is None:
+                return False
+            self._cancel_requested[request_id] = reason
+            worker = self._worker
+        if worker is None:
+            return False
+        cancel = getattr(worker, "cancel", None)
+        if cancel is None:
+            return False
+        return cancel(request_id, reason)
+
+    def is_cancel_requested(self, request_id: str) -> bool:
+        with self._lock:
+            return request_id in self._cancel_requested
 
     def pending_request_ids(self) -> list[str]:
         """当前未收口句柄的 ID 快照（worker 关闭阶段发送取消信号用）。"""
@@ -400,14 +727,23 @@ class RequestManager:
         """
         with self._lock:
             handle = self._pending.get(record.request_id)
-            if handle is None or (handle.seq_id is not None
-                                  and handle.seq_id != record.seq_id):
+            if handle is None or (handle.seq_id is None and handle.stream is not None) \
+                    or (handle.seq_id is not None and handle.seq_id != record.seq_id):
                 handle = None
             else:
                 handle = self._pending.pop(record.request_id)
         if handle is None:
             logger.warning("忽略未知/迟到完成记录: request_id=%s seq_id=%s",
                            record.request_id, record.seq_id)
+            return
+        if handle.stream is not None:
+            # 流式句柄必须保留已排队 token，并把终态放在其后；HTTP
+            # generator 会据此发送 finish chunk，不能把 CompletedRequest
+            # 当作普通 Future 结果直接丢掉。
+            handle.stream.finish(record)
+            self._record_observer_terminal(handle, record, "completed")
+            with self._lock:
+                self._cancel_requested.pop(record.request_id, None)
             return
         try:
             text = self._tokenizer.decode(list(record.completion_token_ids))
@@ -426,14 +762,15 @@ class RequestManager:
             logger.exception("完成结果解码失败: request_id=%s",
                              record.request_id)
             return
+        self._record_observer_terminal(handle, record, "completed")
         _set_future_result(handle.future, result)
 
     def resolve_aborted(self, record: AbortedRequest) -> None:
         """取消/超时/异常记录 → 按原因映射为失败收口（不伪装成成功）。"""
         with self._lock:
             handle = self._pending.get(record.request_id)
-            if handle is None or (handle.seq_id is not None
-                                  and handle.seq_id != record.seq_id):
+            if handle is None or (handle.seq_id is None and handle.stream is not None) \
+                    or (handle.seq_id is not None and handle.seq_id != record.seq_id):
                 handle = None
             else:
                 handle = self._pending.pop(record.request_id)
@@ -441,8 +778,37 @@ class RequestManager:
             logger.warning("忽略未知/迟到中止记录: request_id=%s seq_id=%s reason=%s",
                            record.request_id, record.seq_id, record.finish_reason)
             return
-        _set_future_exception(handle.future,
-                              self._abort_error(record, handle.request_id))
+        error = self._abort_error(record, handle.request_id)
+        if handle.stream is not None:
+            handle.stream.abort(record)
+        else:
+            _set_future_exception(handle.future, error)
+        self._record_observer_terminal(handle, record, "aborted")
+        with self._lock:
+            self._cancel_requested.pop(record.request_id, None)
+
+    def _record_observer_terminal(self, handle, record, status: str) -> None:
+        timeline = getattr(handle, "timeline", None)
+        if timeline is None or self._observer is None:
+            return
+        try:
+            timeline.mark_finished(getattr(record, "finished_at", None))
+            reason = getattr(record, "finish_reason", "") or ""
+            if status == "completed":
+                metric_status = "completed"
+            elif "timeout" in reason or "deadline" in reason:
+                metric_status = "timeout"
+            elif reason in ("engine_error", "execution_error"):
+                metric_status = "engine_error"
+            elif "shutdown" in reason or reason == "engine_exit":
+                metric_status = "server_shutdown"
+            else:
+                metric_status = "cancelled"
+            self._observer.record_timeline(
+                timeline, status=metric_status, finish_reason=reason,
+                log_event=True)
+        except Exception:
+            logger.exception("request observability update failed")
 
     @staticmethod
     def _abort_error(record: AbortedRequest, request_id: str) -> APIError:
@@ -473,7 +839,26 @@ class RequestManager:
         exc = make_error()
         if exc.request_id is None:
             exc.request_id = request_id
-        _set_future_exception(handle.future, exc)
+        if handle.stream is not None:
+            handle.stream.fail(exc)
+        else:
+            _set_future_exception(handle.future, exc)
+        self._record_observer_failure(handle, exc)
+        with self._lock:
+            self._cancel_requested.pop(request_id, None)
+
+    def _record_observer_failure(self, handle, exc) -> None:
+        if self._observer is None or getattr(handle, "timeline", None) is None:
+            return
+        try:
+            timeline = handle.timeline
+            timeline.mark_finished(perf_counter())
+            reason = getattr(exc, "code", "engine_error")
+            status = "server_shutdown" if "draining" in reason else "engine_error"
+            self._observer.record_timeline(
+                timeline, status=status, finish_reason=reason, log_event=True)
+        except Exception:
+            pass
 
     def fail_all(self, make_error: Callable[[], APIError]) -> None:
         """失败全部未收口句柄（Engine 异常/关闭兜底；恰好一次语义由 pop 保证）。"""
