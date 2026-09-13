@@ -14,6 +14,11 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.completed_request import AbortedRequest, CompletedRequest
+
+# 模块重导出：服务层（Day11+）只依赖 LLMEngine 与这两类只读记录，
+# 不需要感知 Scheduler 内部结构
+__all__ = ["LLMEngine", "CompletedRequest", "AbortedRequest"]
 
 # Engine 侧结构化日志：与 Scheduler 共用调用方控制的日志配置，库内不做 basicConfig
 logger = logging.getLogger(__name__)
@@ -118,6 +123,44 @@ class LLMEngine:
     def get_request(self, request_id: str) -> Sequence | None:
         """按 request_id 查找活动请求；请求进入终态后已被清理，返回 None。"""
         return self.scheduler.get_request(request_id)
+
+    @property
+    def max_model_len(self) -> int:
+        """只读暴露上下文上限：服务层在分配 KV 之前做长度预算检查（Day11–12）。"""
+        return self.model_runner.config.max_model_len
+
+    def has_active_requests(self) -> bool:
+        """只读查询：是否存在未进入终态的请求。
+
+        服务 worker 以此决定是否驱动 step()；无活动请求时必须休眠等待，
+        不能连续空转 step。
+        """
+        return bool(self.scheduler.requests)
+
+    def pop_completed(self) -> list[CompletedRequest]:
+        """排出并清空正常完成记录（Day11–12 完成记录通道）。
+
+        - step() 的既有 (outputs, num_tokens) 返回格式不变，本通道是并行的
+          只读补充，不改变 generate() 等既有调用方的行为；
+        - 控制锁内 drain：与 _finalize 的记录写入互斥，重复调用返回空列表
+          （幂等），同一记录不会被返回两次；
+        - 取消/超时/异常请求不出现在本通道，见 pop_aborted()。
+        """
+        with self.scheduler._control_lock:
+            records = list(self.scheduler.completed_records)
+            self.scheduler.completed_records.clear()
+            return records
+
+    def pop_aborted(self) -> list[AbortedRequest]:
+        """排出并清空取消/超时/异常收尾记录，语义与 pop_completed() 相同。
+
+        服务层据此把等待中的请求收口为明确失败（504/503/500），避免
+        Future 永久悬挂；记录不含任何 token 明文。
+        """
+        with self.scheduler._control_lock:
+            records = list(self.scheduler.aborted_records)
+            self.scheduler.aborted_records.clear()
+            return records
 
     def cancel_request(self, request_id: str, reason: str = "client_cancelled") -> bool:
         """取消指定请求（Day10 §4.3 信号语义）：请求不存在或已终态返回 False。
@@ -377,6 +420,10 @@ class LLMEngine:
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens = self.step()
+            # 离线 generate() 仍以 step() 返回值为结果来源；同时排出服务层
+            # 完成记录，避免长期离线调用让控制面 deque 无界增长。
+            self.pop_completed()
+            self.pop_aborted()
             if not output and num_tokens == 0 and not self.is_finished():
                 # 同步驱动的暂停契约：step 无进展且仍有活动请求，说明本轮没有
                 # 可执行候选。两种来源：剩余请求全部处于暂停（PREEMPTED）状态、

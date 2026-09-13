@@ -1,0 +1,7 @@
+{"case": "gpu_health", "status": "pass", "http_status": 200, "request_id": null, "error_code": null, "observed_at": 1987661.725325178}
+{"case": "gpu_models", "status": "pass", "http_status": 200, "request_id": null, "error_code": null, "observed_at": 1987661.728253106}
+{"case": "gpu_completion", "status": "pass", "http_status": 200, "request_id": "cmpl-0c3b9da767064b00b1c78d442c78a32f", "error_code": null, "observed_at": 1987662.137754329}
+{"case": "gpu_chat", "status": "pass", "http_status": 200, "request_id": "chatcmpl-e1de92837e66424fb763cfa1d8310f58", "error_code": null, "observed_at": 1987662.534557631}
+{"case": "gpu_stream_501", "status": "pass", "http_status": 501, "request_id": null, "error_code": "stream_not_implemented", "observed_at": 1987662.539385978}
+{"case": "gpu_invalid_role_400", "status": "pass", "http_status": 400, "request_id": null, "error_code": "invalid_request_error", "observed_at": 1987662.543193663}
+{"case": "summary", "mode": "gpu", "status": "pass", "total": 6, "failures": 0, "wall_seconds": 1.011, "observed_at": 1987662.543539019}

@@ -1,6 +1,6 @@
 # NanoServe 文档索引
 
-按 `plan.md` 的 20 天计划组织，当前覆盖 **Day 1–10**（Day 9 已完成实现与验收；Day 10 已完成实现、代码审查与 CPU 验收，GPU 主流程证据沿用已有记录，详见 `day10-validation.md` 与 `day10-review.md`）。Day7 已完成实现与验收，记录见 `day7-validation.md`；Day8 已在 `feature/chunked-prefill` 分支完成实现，验收记录见 `day8-validation.md`。
+按 `plan.md` 的 20 天计划组织，当前实现与验收覆盖 **Day 1–10 与 Day 11–12**（Day11–12 OpenAI 兼容 HTTP API 已在 `feature/openai-api-day11-12` 分支完成实现，并通过 CPU/ASGI 与 TP=1 eager 最小 GPU HTTP 验收；完整生产边界仍部分覆盖，详见 `day11-12-validation.md` 与 `day11-12-review.md`；SSE/断连检测留给 Day13）。Day 9 已完成实现与验收；Day 10 已完成实现、代码审查与 CPU 验收，GPU 主流程证据沿用已有记录，详见 `day10-validation.md` 与 `day10-review.md`。Day7 已完成实现与验收，记录见 `day7-validation.md`；Day8 已在 `feature/chunked-prefill` 分支完成实现，验收记录见 `day8-validation.md`。
 
 ## 按天索引
 
@@ -34,6 +34,10 @@
 - [Day 10 验收记录](./day10-validation.md)：实现范围与取舍（signal-only 取消/安全点收尾、victim 队尾优先与无 victim 延后、abort 事务、账本守恒检查）、修复后 CPU 377 项回归与 5 场景验收、GPU 六组矩阵（含 16 块小池 3 次自动抢占与 100 请求终态平衡），并记录本轮审查后的未覆盖边界；原始 JSONL 证据位于 `docs/evidence/day10/`。
 - [Day 10 实现审查](./day10-review.md)：逐项复核状态/控制面、抢占恢复、异常清理、KV 账本、序列化与事件契约；记录最终修复项、377 项 CPU 回归、TP=1 GPU 六组证据和 TP>1/CUDA Graph/真实并发等未覆盖边界。
 - [Day 10 教程](./day10-tutorial.md)：面向初学者讲解三种进度、六态生命周期、取消与 deadline 安全点、KV 抢占恢复、异常事务、账本所有权、事件审计、测试证据与后续服务化衔接。
+- [Day 11–12 OpenAI 兼容 HTTP API 设计](./openai-api-day11-12.md)：合并规划 `/v1/completions` 与 `/v1/chat/completions`、统一内部请求、单 Engine worker、完成记录、错误/生命周期契约、CPU/GPU 测试和验收方案；SSE 明确留给 Day13。
+- [Day 11–12 验收记录](./day11-12-validation.md)：实现范围、修复后的 CPU 117 项服务测试与全量 495 项回归（含 `python -O`）、CPU ASGI 18 项与 GPU RTX 4090 D TP=1 eager 严格 HTTP 8 项验收；区分脚本证据、手工观察和未覆盖生产边界，原始 JSONL 位于 `docs/evidence/day11-12/`。
+- [Day 11–12 实现审查](./day11-12-review.md)：对照设计文档复核服务、worker、完成记录、上下文校验、并发/关闭生命周期和验收脚本；记录修复项、代码简化建议及 TP>1、CUDA Graph、SSE/断连、GPU 504 和长期压力等未覆盖边界。
+- [Day 11–12 教程](./day11-12-tutorial.md)：面向初学者讲解 HTTP 到 Engine 的完整请求链路、统一 InternalRequest、chat template、完成记录、单 worker 批处理、Future/取消/关闭、测试方法、典型缺陷和后续 Day13/14 衔接。
 
 ## 其他
 

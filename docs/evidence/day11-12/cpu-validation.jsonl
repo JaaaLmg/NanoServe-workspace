@@ -1,0 +1,18 @@
+{"case": "health_ready", "status": "pass", "http_status": 200, "request_id": null, "error_code": null, "observed_at": 1987187.744749518}
+{"case": "models_and_validation_consistent", "status": "pass", "http_status": 200, "request_id": null, "error_code": "model_not_found", "observed_at": 1987187.74887711}
+{"case": "completion_non_stream", "status": "pass", "http_status": 200, "request_id": "cmpl-00c65239d8e84b6295ec162070e72698", "error_code": null, "observed_at": 1987187.750747607}
+{"case": "chat_non_stream", "status": "pass", "http_status": 200, "request_id": "chatcmpl-accbc3292f0949f2854e3c7da6093774", "error_code": null, "observed_at": 1987187.75297682}
+{"case": "chat_template_call_args", "status": "pass", "http_status": 200, "request_id": null, "error_code": null, "observed_at": 1987187.75448465}
+{"case": "sampling_params_consistent", "status": "pass", "http_status": 200, "request_id": null, "error_code": null, "observed_at": 1987187.757283322}
+{"case": "error_invalid_role", "status": "pass", "http_status": 400, "request_id": null, "error_code": "invalid_request_error", "observed_at": 1987187.758289346}
+{"case": "error_empty_messages", "status": "pass", "http_status": 400, "request_id": null, "error_code": "invalid_request_error", "observed_at": 1987187.759258557}
+{"case": "error_context_length", "status": "pass", "http_status": 400, "request_id": null, "error_code": "context_length_exceeded", "observed_at": 1987187.760583964}
+{"case": "error_model_not_found", "status": "pass", "http_status": 404, "request_id": null, "error_code": "model_not_found", "observed_at": 1987187.762042869}
+{"case": "error_stream_501", "status": "pass", "http_status": 501, "request_id": null, "error_code": "stream_not_implemented", "observed_at": 1987187.763267031}
+{"case": "single_step_driver", "status": "pass", "http_status": null, "request_id": "[('cmpl-13fbe6d3b28d400a88735c2ed6c7d8ad', 200), ('cmpl-ff8327ff1a9c4b6289f3bff1d4afb197', 200), ('cmpl-ce02757c34d14550bfd3d79c648a06de', 200)]", "error_code": null, "observed_at": 1987187.767642725}
+{"case": "engine_error_500", "status": "pass", "http_status": 500, "request_id": null, "error_code": "engine_error", "observed_at": 1987187.769423265}
+{"case": "draining_503", "status": "pass", "http_status": 503, "request_id": null, "error_code": "service_draining", "observed_at": 1987187.771169887}
+{"case": "record_drain_idempotent", "status": "pass", "http_status": null, "request_id": null, "error_code": null, "observed_at": 1987187.772482502}
+{"case": "request_id_reuse_isolated", "status": "pass", "http_status": null, "request_id": null, "error_code": null, "observed_at": 1987187.772484174}
+{"case": "exit_idempotent", "status": "pass", "http_status": null, "request_id": null, "error_code": null, "observed_at": 1987187.772487087}
+{"case": "summary", "mode": "cpu", "status": "pass", "total": 17, "failures": 0, "wall_seconds": 5.704, "observed_at": 1987187.772654413}

@@ -9,6 +9,7 @@ from nanovllm.config import Config, validate_positive_int
 from nanovllm.engine.sequence import (InvalidStateTransition, Sequence,
                                       SequenceStatus)
 from nanovllm.engine.block_manager import BlockManager
+from nanovllm.engine.completed_request import AbortedRequest, CompletedRequest
 
 # 模块级 logger：库代码不做 basicConfig，日志开关由调用方（验收脚本/服务层）控制
 logger = logging.getLogger(__name__)
@@ -162,6 +163,15 @@ class Scheduler:
         # 请求终态（从 requests 移除）后其 ID 允许复用
         self._active_request_ids: set[str] = set()
 
+        # Day11–12 完成记录通道（rank 0 控制面，不进 TP payload）：终态请求在
+        # _finalize 捕获只读记录，由 LLMEngine.pop_completed()/pop_aborted()
+        # 排出给服务 worker 消费（幂等 drain：pop 后清空，重复调用返回空）。
+        # 离线 generate() 不消费也不受影响——记录随 Engine 生命周期废弃。
+        # 队列无上限：服务模式 worker 每轮 step 后即消费；离线模式记录量以
+        # 历史请求数为上界，且只保留 completion token 计数级的小对象。
+        self.completed_records: deque[CompletedRequest] = deque()
+        self.aborted_records: deque[AbortedRequest] = deque()
+
         # ---------- Day7：轮次与预算等待统计（rank 0 内部字段，不进 TP payload） ----------
         # 每次 schedule 自增的单调轮次 ID；空轮也分配，不用外部 ID 充当轮次 ID
         self._round_counter = 0
@@ -256,6 +266,29 @@ class Scheduler:
         """
         if self.requests.get(seq.seq_id) is not seq:
             return
+        # Day11–12：在终态迁移与资源清理之间捕获只读终态记录（§4.4），
+        # 保证 request_id、finish_reason 和 token 计数与终态同源。所有权检查
+        # 已通过，意味着这是该 seq 的首次（唯一一次）收尾，不会重复记录；
+        # 后续对同一 seq 的幂等重复收尾在上方即被所有权检查拦截。
+        # 异常路径（abort_all_active）产生的 CANCELLED 记录同样进入通道，
+        # 服务层按 finish_reason 映射为失败结果，不伪装成正常 completion。
+        if seq.status is SequenceStatus.FINISHED:
+            self.completed_records.append(CompletedRequest(
+                seq_id=seq.seq_id, request_id=seq.request_id,
+                completion_token_ids=tuple(seq.completion_token_ids),
+                prompt_tokens=seq.num_prompt_tokens,
+                completion_tokens=seq.num_completion_tokens,
+                finish_reason=seq.finish_reason or "stop",
+                finished_at=seq.finished_at if seq.finished_at is not None
+                else (now if now is not None else self._clock()),
+            ))
+        elif seq.status in (SequenceStatus.CANCELLED, SequenceStatus.TIMEOUT):
+            self.aborted_records.append(AbortedRequest(
+                seq_id=seq.seq_id, request_id=seq.request_id,
+                finish_reason=seq.finish_reason or seq.status.name.lower(),
+                finished_at=seq.finished_at if seq.finished_at is not None
+                else (now if now is not None else self._clock()),
+            ))
         self._remove_from_queues(seq)
         self._release_sequence(seq)
         del self.requests[seq.seq_id]
